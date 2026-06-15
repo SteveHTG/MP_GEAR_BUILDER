@@ -3,16 +3,16 @@
 // Version this string any time you deploy updated files so the SW
 // triggers an install + activate cycle and the cache refreshes.
 
-const CACHE_NAME = 'mp-gear-builder-v2';
+const CACHE_NAME = 'mp-gear-builder-v4';
 
 // Every URL the app needs to function offline.
 // Add any additional static assets your build outputs here.
 const PRECACHE_URLS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/service-worker.js',
-  '/catalog.js',
+  './',
+  './index.html',
+  './manifest.json',
+  './service-worker.js',
+  // catalog.js inlined into index.html
   // CDN dependencies loaded at runtime by index.html / the app
   'https://cdn.tailwindcss.com',
   'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
@@ -108,7 +108,7 @@ self.addEventListener('fetch', event => {
         .catch(() => {
           // Completely offline and nothing cached — return offline page.
           if (event.request.destination === 'document') {
-            return caches.match('/index.html');
+            return caches.match('./index.html');
           }
         });
     })
