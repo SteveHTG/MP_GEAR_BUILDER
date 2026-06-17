@@ -3,7 +3,7 @@
 // Version this string any time you deploy updated files so the SW
 // triggers an install + activate cycle and the cache refreshes.
 
-const CACHE_NAME = 'mp-gear-builder-v8';
+const CACHE_NAME = 'mp-gear-builder-v9';
 
 // Every URL the app needs to function offline.
 // Add any additional static assets your build outputs here.
@@ -21,6 +21,15 @@ const PRECACHE_URLS = [
   'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
 ];
 
+// JSON data the app fetches via JS at runtime (window.fetch().then(r => r.json())).
+// These must be cached with a normal CORS-mode request (not no-cors) or the
+// cached response comes back opaque and unreadable by the app's JS later.
+// raw.githubusercontent.com sends Access-Control-Allow-Origin: *, so this works.
+const PRECACHE_CORS_URLS = [
+  'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/sku_page_map.json',
+  'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/cross_reference.json',
+];
+
 // ── Install: pre-cache all app shell assets ───────────────────────────────────
 self.addEventListener('install', event => {
   console.log('[SW] Install — caching app shell');
@@ -36,6 +45,11 @@ self.addEventListener('install', event => {
         ...crossOrigin.map(url =>
           cache.add(new Request(url, { mode: 'no-cors' })).catch(err =>
             console.warn('[SW] Could not pre-cache', url, err)
+          )
+        ),
+        ...PRECACHE_CORS_URLS.map(url =>
+          cache.add(url).catch(err =>
+            console.warn('[SW] Could not pre-cache (cors)', url, err)
           )
         ),
       ]);

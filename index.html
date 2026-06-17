@@ -44,6 +44,22 @@ const parsePrice = p => {
 const fmtMoney = n => n == null ? 'TBD' : '$' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 const MATCH_CATS = new Set(['Outershell Material', 'Moisture Barrier', 'Thermal Liner']);
 
+// ─── Diagram Lookup: SKU → Technical Manual Page(s) ──────────────────────────
+const MANUAL_PDF_URL = 'https://www.dropbox.com/scl/fi/lshb68c7h1sugwwuxfn10/HFR-product-Tech-Pak.pdf?rlkey=zealc0lu3uof2yv4na6xtnhpn&raw=1';
+const MANUAL_PAGE_IMAGE_BASE_URL = 'https://raw.githubusercontent.com/SteveHTG/MP_GEAR_BUILDER/main/page_';
+const SKU_PAGE_MAP_URL = 'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/sku_page_map.json';
+const CROSS_REFERENCE_URL = 'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/cross_reference.json';
+
+const normalizeSku = s => (s == null ? '' : String(s).trim().toUpperCase());
+
+function buildNormalizedMap(raw) {
+  const out = {};
+  Object.keys(raw || {}).forEach(k => { out[normalizeSku(k)] = raw[k]; });
+  return out;
+}
+
+const DiagramContext = React.createContext(null);
+
 // ─── Category ordering & nesting config ──────────────────────────────────────
 // For coat: OS → TL → MB first, then rest alphabetical
 // Layer order: Outershell Material, Thermal Liner, Moisture Barrier
@@ -235,6 +251,8 @@ function ItemRow({ item, itemKey, checked, qty, onToggle, onQtyChange, showCateg
   const isTBD = item.price === 'TBD';
   const price = parsePrice(item.price);
   const desc = item.description && item.description !== '-' ? item.description : '';
+  const diagramCtx = React.useContext(DiagramContext);
+  const diagramMatch = item.sku && diagramCtx ? diagramCtx.lookupDiagram(item.sku) : null;
   const handleCheckbox = () => {
     if (checked) { onQtyChange(itemKey, 0); onToggle(itemKey); }
     else { onQtyChange(itemKey, 1); onToggle(itemKey); }
@@ -247,7 +265,15 @@ function ItemRow({ item, itemKey, checked, qty, onToggle, onQtyChange, showCateg
     React.createElement('div', { className: 'flex-1 min-w-0' },
       showCategory && React.createElement('div', { className: 'text-xs text-slate-500 mb-0.5' }, item.category),
       React.createElement('div', { className: 'flex items-center gap-1 flex-wrap' },
-        item.sku && React.createElement('span', { className: 'text-xs font-mono text-blue-300' }, item.sku),
+        item.sku && (diagramMatch
+          ? React.createElement('button', {
+              type: 'button',
+              onClick: () => diagramCtx.openDiagram(item.sku),
+              title: 'View diagram — manual page ' + diagramMatch.pages[0] +
+                (diagramMatch.pages.length > 1 ? ' (+' + (diagramMatch.pages.length - 1) + ' more)' : ''),
+              className: 'text-xs font-mono font-bold text-blue-300 hover:text-blue-200 cursor-pointer'
+            }, item.sku)
+          : React.createElement('span', { className: 'text-xs font-mono text-blue-300' }, item.sku)),
         desc && React.createElement('span', { className: 'text-sm text-slate-200' }, desc)
       )
     ),
@@ -703,6 +729,70 @@ function generatePDF(coatItems, pantItems, pantType, suspItems, coatTotal, pantT
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────────────────────────────
+// ─── DiagramModal ─────────────────────────────────────────────────────────────
+function DiagramModal({ modal, onClose, onSelectPage }) {
+  const [loadedSrc, setLoadedSrc] = React.useState(null);
+  const [errorSrc, setErrorSrc] = React.useState(null);
+
+  if (!modal.open) return null;
+  const { sku, pages, activeIdx } = modal;
+  const activePage = pages[activeIdx];
+  const imgUrl = MANUAL_PAGE_IMAGE_BASE_URL + activePage + '.png';
+  const isLoaded = loadedSrc === imgUrl;
+  const hasError = errorSrc === imgUrl;
+
+  return React.createElement('div', {
+    className: 'fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4',
+    onClick: onClose
+  },
+    React.createElement('div', {
+      className: 'bg-slate-800 border border-slate-600 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden',
+      onClick: e => e.stopPropagation()
+    },
+      React.createElement('div', { className: 'flex items-center justify-between px-5 py-3 bg-slate-900 border-b border-slate-700' },
+        React.createElement('div', null,
+          React.createElement('div', { className: 'text-xs text-slate-400 uppercase tracking-wider' }, 'Technical Manual'),
+          React.createElement('div', { className: 'text-sm font-bold text-blue-300 font-mono' }, sku)
+        ),
+        React.createElement('button', { onClick: onClose, className: 'text-slate-400 hover:text-white text-2xl leading-none px-2' }, '\u00d7')
+      ),
+      pages.length > 1 && React.createElement('div', { className: 'flex flex-wrap items-center gap-2 px-5 py-3 bg-slate-900/60 border-b border-slate-700 max-h-32 overflow-y-auto' },
+        React.createElement('span', { className: 'text-xs text-slate-400 mr-1' }, 'Appears on ' + pages.length + ' pages:'),
+        pages.map((pg, idx) => React.createElement('button', {
+          key: pg,
+          onClick: () => onSelectPage(idx),
+          className: 'text-xs font-mono px-2 py-1 rounded border ' + (idx === activeIdx
+            ? 'bg-blue-700 border-blue-500 text-white font-bold'
+            : 'bg-slate-800 border-slate-600 text-slate-300 hover:border-slate-400')
+        }, pg))
+      ),
+      React.createElement('div', { className: 'flex-1 min-h-[300px] bg-slate-950 flex items-center justify-center overflow-auto p-3' },
+        hasError
+          ? React.createElement('div', { className: 'text-center px-6' },
+              React.createElement('p', { className: 'text-slate-400 text-sm mb-3' }, "This page's diagram image couldn't be loaded."),
+              React.createElement('a', { href: MANUAL_PDF_URL, target: '_blank', rel: 'noopener noreferrer',
+                className: 'text-xs text-blue-400 hover:text-blue-300 underline' }, 'Open full manual (PDF) \u2197')
+            )
+          : React.createElement(React.Fragment, null,
+              !isLoaded && React.createElement('div', { className: 'text-slate-500 text-sm' }, 'Loading diagram\u2026'),
+              React.createElement('img', {
+                key: imgUrl,
+                src: imgUrl,
+                alt: 'Manual page ' + activePage,
+                onLoad: () => setLoadedSrc(imgUrl),
+                onError: () => setErrorSrc(imgUrl),
+                className: 'max-w-full max-h-full object-contain rounded shadow-lg ' + (isLoaded ? '' : 'hidden')
+              })
+            )
+      ),
+      React.createElement('div', { className: 'px-5 py-2.5 bg-slate-900 border-t border-slate-700 text-center' },
+        React.createElement('a', { href: MANUAL_PDF_URL, target: '_blank', rel: 'noopener noreferrer', className: 'text-xs text-blue-400 hover:text-blue-300 underline' },
+          'Open full manual (PDF) \u2197')
+      )
+    )
+  );
+}
+
 function App() {
   const [tab, setTab] = React.useState('coat');
   const [pantType, setPantType] = React.useState('');
@@ -722,6 +812,53 @@ function App() {
   const [coatNotes, setCoatNotes] = React.useState('');
   const [pantNotes, setPantNotes] = React.useState('');
   const [manualOverrides, setManualOverrides] = React.useState({ lto: new Set(), pfp: new Set() });
+  const [diagramData, setDiagramData] = React.useState({ ready: false, pageMap: {}, xrefMap: {} });
+  const [diagramModal, setDiagramModal] = React.useState({ open: false, sku: '', pages: [], activeIdx: 0 });
+
+  React.useEffect(() => {
+    let cancelled = false;
+    Promise.all([fetch(SKU_PAGE_MAP_URL), fetch(CROSS_REFERENCE_URL)])
+      .then(([pmRes, xrRes]) => {
+        if (!pmRes.ok || !xrRes.ok) throw new Error('Manual reference fetch failed: ' + pmRes.status + '/' + xrRes.status);
+        return Promise.all([pmRes.json(), xrRes.json()]);
+      })
+      .then(([pmRaw, xrRaw]) => {
+        if (cancelled) return;
+        setDiagramData({ ready: true, pageMap: buildNormalizedMap(pmRaw), xrefMap: buildNormalizedMap(xrRaw) });
+      })
+      .catch(err => {
+        console.warn('[DiagramLookup] Could not load manual reference data:', err);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const lookupDiagram = React.useCallback(sku => {
+    if (!diagramData.ready) return null;
+    const norm = normalizeSku(sku);
+    if (!norm) return null;
+    let pages = diagramData.pageMap[norm];
+    let resolvedSku = norm;
+    if (!pages) {
+      const translated = diagramData.xrefMap[norm];
+      if (translated) {
+        const tnorm = normalizeSku(translated);
+        pages = diagramData.pageMap[tnorm];
+        if (pages) resolvedSku = tnorm;
+      }
+    }
+    if (!pages || !pages.length) return null;
+    return { sku: resolvedSku, pages };
+  }, [diagramData]);
+
+  const openDiagram = React.useCallback(sku => {
+    const match = lookupDiagram(sku);
+    if (!match) return;
+    setDiagramModal({ open: true, sku: match.sku, pages: match.pages, activeIdx: 0 });
+  }, [lookupDiagram]);
+
+  const closeDiagram = React.useCallback(() => setDiagramModal(m => ({...m, open: false})), []);
+  const selectDiagramPage = React.useCallback(idx => setDiagramModal(m => ({...m, activeIdx: idx})), []);
+  const diagramCtxValue = React.useMemo(() => ({ lookupDiagram, openDiagram }), [lookupDiagram, openDiagram]);
 
   React.useEffect(() => { window.__setSuspEnabled = setSuspEnabled; return () => { delete window.__setSuspEnabled; }; }, []);
 
@@ -835,7 +972,8 @@ function App() {
     if (typeof window!=='undefined'&&!window.jspdf) { const s=document.createElement('script'); s.src='https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'; document.head.appendChild(s); }
   },[]);
 
-  return React.createElement('div', { className: 'min-h-screen bg-slate-950 text-slate-100 font-sans' },
+  return React.createElement(DiagramContext.Provider, { value: diagramCtxValue },
+  React.createElement('div', { className: 'min-h-screen bg-slate-950 text-slate-100 font-sans' },
     React.createElement('header', { className: 'bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 border-b border-slate-700 shadow-xl' },
       React.createElement('div', { className: 'max-w-7xl mx-auto px-4 py-4' },
         React.createElement('div', { className: 'flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4' },
@@ -959,7 +1097,9 @@ function App() {
           React.createElement('button', { onClick:()=>setShowReset(false), className:'flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold py-2.5 rounded-lg transition-colors' }, 'Cancel')
         )
       )
-    )
+    ),
+    React.createElement(DiagramModal, { modal: diagramModal, onClose: closeDiagram, onSelectPage: selectDiagramPage })
+  )
   );
 }
 const root = ReactDOM.createRoot(document.getElementById('root'));
@@ -992,4 +1132,3 @@ root.render(React.createElement(App));
     }
   </script>
 </body>
-</html>
