@@ -3,7 +3,7 @@
 // Version this string any time you deploy updated files so the SW
 // triggers an install + activate cycle and the cache refreshes.
 
-const CACHE_NAME = 'mp-gear-builder-v9';
+const CACHE_NAME = 'mp-gear-builder-v10';
 
 // Every URL the app needs to function offline.
 // Add any additional static assets your build outputs here.
