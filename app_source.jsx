@@ -230,54 +230,6 @@ function getLTOCategories(rawCats) {
   result.push('__SUSPENDERS__');
   return result;
 }
-function getPFPCategories(rawCats) {
-  const priority = ['Outershell Material', 'Thermal Liner', 'Moisture Barrier'];
-  const prioritySet = new Set(priority);
-  const rest = rawCats.filter((c) => !prioritySet.has(c) && !PFP_SUPPRESS.has(c)).sort();
-  const result = [...priority];
-  const injected = new Set();
-  for (const c of rest) {
-    if (c[0] >= 'M' && !injected.has('__PFP_POCKETS__')) {
-      result.push('__PFP_POCKETS__');
-      injected.add('__PFP_POCKETS__');
-    }
-    result.push(c);
-  }
-  if (!injected.has('__PFP_POCKETS__')) result.push('__PFP_POCKETS__');
-  result.push('__SUSPENDERS__');
-  return result;
-}
-
-// Same suppression/grouping scheme as getLTOCategories, but restricted to LTO
-// categories with no PFP equivalent (no OS/TL/MB priority, no suspenders --
-// those are already covered by the PFP-native category list).
-function getLTOExtraCategoriesForPFP(ltoCategories, pfpCategories) {
-  const pfpSet = new Set(pfpCategories);
-  const rest = ltoCategories
-    .filter((c) => !pfpSet.has(c) && !LTO_SUPPRESS.has(c) && c !== 'Take Up Straps')
-    .sort();
-  const result = [];
-  const injected = new Set();
-  for (const c of rest) {
-    if (c[0] >= 'K' && !injected.has('__KNEES__')) {
-      result.push('__KNEES__');
-      injected.add('__KNEES__');
-    }
-    if (c[0] >= 'P' && !injected.has('__LTO_POCKETS__')) {
-      result.push('__LTO_POCKETS__');
-      injected.add('__LTO_POCKETS__');
-    }
-    if (c[0] >= 'T' && !injected.has('__TAKEUP__')) {
-      result.push('__TAKEUP__');
-      injected.add('__TAKEUP__');
-    }
-    result.push(c);
-  }
-  if (!injected.has('__KNEES__')) result.push('__KNEES__');
-  if (!injected.has('__LTO_POCKETS__')) result.push('__LTO_POCKETS__');
-  if (!injected.has('__TAKEUP__')) result.push('__TAKEUP__');
-  return result;
-}
 
 // ─── QtySelector ──────────────────────────────────────────────────────────────────────────────
 function QtySelector({ itemKey, qty, checked, onToggle, onQtyChange }) {
@@ -753,17 +705,30 @@ function PantPanel({
   const data = CATALOG[pantType];
   if (!data) return null;
   const { items, categories } = data;
+  // In PFP mode, the displayed item list is PFP's own items plus LTO's items
+  // for any category PFP has no equivalent for -- one unified list, so the
+  // whole pants view reads as a single LTO-style accordion regardless of
+  // which pant type is active, just with PFP's own items substituted in
+  // wherever PFP has them.
+  const displayItems = React.useMemo(() => {
+    if (pantType !== 'pfp') return items.map((item, gi) => ({ ...item, _gi: gi }));
+    const ownItems = CATALOG.pfp.items.map((item, gi) => ({ ...item, _gi: gi }));
+    const fallbackItems = [];
+    CATALOG.lto.items.forEach((item, gi) => {
+      if (LTO_ONLY_PANT_CATEGORIES.has(item.category)) {
+        fallbackItems.push({ ...item, _gi: gi });
+      }
+    });
+    return [...ownItems, ...fallbackItems];
+  }, [pantType, items]);
   const byCategory = React.useMemo(() => {
     const map = {};
-    items.forEach((item, gi) => {
+    displayItems.forEach((item) => {
       if (!map[item.category]) map[item.category] = [];
-      map[item.category].push({
-        ...item,
-        _gi: gi,
-      });
+      map[item.category].push(item);
     });
     return map;
-  }, [items]);
+  }, [displayItems]);
   const suspData = CATALOG.suspenders;
   const suspByCategory = React.useMemo(() => {
     if (!suspData) return {};
@@ -777,66 +742,30 @@ function PantPanel({
     });
     return map;
   }, [suspData]);
-  // PFP-only: LTO categories with no PFP equivalent still show as a fallback,
-  // sourced from LTO's own item list (not PFP's), so nothing available under
-  // LTO disappears just because PFP was picked.
-  const ltoExtraByCategory = React.useMemo(() => {
-    if (pantType !== 'pfp') return {};
-    const map = {};
-    CATALOG.lto.items.forEach((item, gi) => {
-      if (!LTO_ONLY_PANT_CATEGORIES.has(item.category)) return;
-      if (!map[item.category]) map[item.category] = [];
-      map[item.category].push({
-        ...item,
-        _gi: gi,
-      });
-    });
-    return map;
-  }, [pantType]);
-  const extraCats = React.useMemo(
-    () =>
-      pantType === 'pfp'
-        ? getLTOExtraCategoriesForPFP(CATALOG.lto.categories, CATALOG.pfp.categories)
-        : [],
-    [pantType],
-  );
-  const orderedCats = React.useMemo(
-    () => (pantType === 'lto' ? getLTOCategories(categories) : getPFPCategories(categories)),
-    [categories, pantType],
-  );
+  // PFP mode: order/group the union of LTO + PFP category names exactly the
+  // same way LTO's own category list is ordered and grouped (same priority,
+  // same Knee/Pockets/Take-Up accordions). PFP's "Miscellaneous" category is
+  // filtered out of the flat list here because it gets folded into the
+  // Pockets group below instead (mirroring how LTO's own pocket categories
+  // are grouped), so it doesn't also render as a separate flat entry.
+  const orderedCats = React.useMemo(() => {
+    if (pantType === 'lto') return getLTOCategories(categories);
+    const unionCats = [...new Set([...CATALOG.lto.categories, ...CATALOG.pfp.categories])].filter(
+      (c) => !PFP_SUPPRESS.has(c),
+    );
+    return getLTOCategories(unionCats);
+  }, [categories, pantType]);
   const q = search.toLowerCase();
   if (search) {
-    const matched = items
-      .map((item, gi) => ({
-        ...item,
-        _gi: gi,
-      }))
-      .filter(
-        (item) =>
-          (item.sku || '').toLowerCase().includes(q) ||
-          (item.description || '').toLowerCase().includes(q) ||
-          (item.category || '').toLowerCase().includes(q),
-      );
-    // PFP mode also searches the LTO-only fallback categories, since they're
-    // visibly part of the pants selection even though PFP is the active type.
-    const extraMatched =
-      pantType === 'pfp'
-        ? CATALOG.lto.items
-            .map((item, gi) => ({
-              ...item,
-              _gi: gi,
-            }))
-            .filter((item) => LTO_ONLY_PANT_CATEGORIES.has(item.category))
-            .filter(
-              (item) =>
-                (item.sku || '').toLowerCase().includes(q) ||
-                (item.description || '').toLowerCase().includes(q) ||
-                (item.category || '').toLowerCase().includes(q),
-            )
-        : [];
+    const matched = displayItems.filter(
+      (item) =>
+        (item.sku || '').toLowerCase().includes(q) ||
+        (item.description || '').toLowerCase().includes(q) ||
+        (item.category || '').toLowerCase().includes(q),
+    );
     return (
       <SearchResultsPanel
-        items={[...matched, ...extraMatched]}
+        items={matched}
         selections={selections}
         quantities={quantities}
         onToggle={onToggle}
@@ -868,22 +797,9 @@ function PantPanel({
             <ParentAccordion
               key="__LTO_POCKETS__"
               title="Pockets"
-              subCats={[...LTO_POCKET_SUBS]}
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="pant"
-              search={search}
-            />
-          );
-        if (cat === '__PFP_POCKETS__')
-          return (
-            <ParentAccordion
-              key="__PFP_POCKETS__"
-              title="Pockets"
-              subCats={[...PFP_POCKET_SUBS]}
+              subCats={
+                pantType === 'pfp' ? [...LTO_POCKET_SUBS, ...PFP_POCKET_SUBS] : [...LTO_POCKET_SUBS]
+              }
               byCategory={byCategory}
               selections={selections}
               quantities={quantities}
@@ -979,81 +895,6 @@ function PantPanel({
           />
         );
       })}
-      {pantType === 'pfp' && extraCats.length > 0 && (
-        <div className="mt-4">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="h-px flex-1 bg-slate-700" />
-            <span className="text-sm font-bold text-amber-400 uppercase tracking-wider">
-              Additional LTO-Only Options
-            </span>
-            <div className="h-px flex-1 bg-slate-700" />
-          </div>
-          <div className="space-y-1">
-            {extraCats.map((cat) => {
-              if (cat === '__KNEES__')
-                return (
-                  <ParentAccordion
-                    key="__LTO_EXTRA_KNEES__"
-                    title="Knee Options"
-                    subCats={[...LTO_KNEE_SUBS]}
-                    byCategory={ltoExtraByCategory}
-                    selections={selections}
-                    quantities={quantities}
-                    onToggle={onToggle}
-                    onQtyChange={onQtyChange}
-                    prefix="pant"
-                    search={search}
-                  />
-                );
-              if (cat === '__LTO_POCKETS__')
-                return (
-                  <ParentAccordion
-                    key="__LTO_EXTRA_POCKETS__"
-                    title="Pockets"
-                    subCats={[...LTO_POCKET_SUBS]}
-                    byCategory={ltoExtraByCategory}
-                    selections={selections}
-                    quantities={quantities}
-                    onToggle={onToggle}
-                    onQtyChange={onQtyChange}
-                    prefix="pant"
-                    search={search}
-                  />
-                );
-              if (cat === '__TAKEUP__')
-                return (
-                  <ParentAccordion
-                    key="__LTO_EXTRA_TAKEUP__"
-                    title="Take Up Straps"
-                    subCats={['Take Up Straps', ...LTO_TAKEUP_SUBS]}
-                    byCategory={ltoExtraByCategory}
-                    selections={selections}
-                    quantities={quantities}
-                    onToggle={onToggle}
-                    onQtyChange={onQtyChange}
-                    prefix="pant"
-                    search={search}
-                  />
-                );
-              const extraItems = ltoExtraByCategory[cat] || [];
-              if (!extraItems.length) return null;
-              return (
-                <CategoryAccordion
-                  key={'__LTO_EXTRA__' + cat}
-                  catName={cat}
-                  items={extraItems}
-                  selections={selections}
-                  quantities={quantities}
-                  onToggle={onToggle}
-                  onQtyChange={onQtyChange}
-                  prefix="pant"
-                  autoCollapseOnSelect={false}
-                />
-              );
-            })}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
