@@ -7,8 +7,31 @@ const parsePrice = (p) => {
   const n = parseFloat(p.replace(/[$,]/g, ''));
   return isNaN(n) ? null : n;
 };
-const fmtMoney = (n) =>
-  n == null ? 'TBD' : '$' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const fmtMoney = (n) => {
+  if (n == null) return 'TBD';
+  const sign = n < 0 ? '-' : '';
+  return (
+    sign +
+    '$' +
+    Math.abs(n)
+      .toFixed(2)
+      .replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  );
+};
+// Pant items from the V4 catalog carry a separate price per materials grade
+// (priceStd / pricePrm) instead of a single price string. This resolves the
+// correct one for the currently-selected grade, falling back to whichever is
+// available if that specific row doesn't have a price for the active grade.
+// Items without these fields (coat, suspenders, PFP-native) fall through to
+// the original single price string unchanged, so this is a safe drop-in
+// replacement for parsePrice(item.price) everywhere pricing is summed/shown.
+const resolveItemPrice = (item, grade) => {
+  if (item.priceStd != null || item.pricePrm != null) {
+    if (grade === 'prm') return item.pricePrm != null ? item.pricePrm : item.priceStd;
+    return item.priceStd != null ? item.priceStd : item.pricePrm;
+  }
+  return parsePrice(item.price);
+};
 const MATCH_CATS = new Set(['Outershell Material', 'Moisture Barrier', 'Thermal Liner']);
 
 // ─── PFP/LTO Pant Merge ───────────────────────────────────────────────────────
@@ -57,6 +80,11 @@ function buildNormalizedMap(raw) {
   return out;
 }
 const DiagramContext = React.createContext(null);
+// Holds the currently-selected materials grade ('std' | 'prm') so deeply
+// nested pant-rendering components (ItemRow, CategoryAccordion,
+// ParentAccordion) can resolve the correct price without prop-drilling it
+// through every intermediate component.
+const MaterialsGradeContext = React.createContext('std');
 
 // ─── Category ordering & nesting config ──────────────────────────────────────
 // For coat: OS → TL → MB first, then rest alphabetical
@@ -114,55 +142,6 @@ const COAT_SUPPRESS = new Set([
   'Belt Loops', // moved to pants
 ]);
 
-// LTO knee sub-categories
-const LTO_KNEE_SUBS = new Set([
-  '3D BiFlex Knees',
-  '3D BiFlex Knee Padding',
-  'BFHC Knees Sewn',
-  'BFHC Knees Replaceable',
-  'Additional Options',
-  'HC Knees Sewn',
-  'HC Knees Sewn OS',
-  'HC Knees Sewn ARA',
-  'HC Knees Sewn Kevlar',
-  'HC Knee Additional Options',
-  'Reinforced Knees Sewn',
-  'Reinf Knees Replaceable',
-  'Cushioned Knees Sewn',
-  'Cushioned Knees Replaceable',
-  'Misc Loose Knee Options',
-  'Replacement HC Knee Pads - Large',
-  'Replacement HC Knee Pads - Small',
-  'Repl BF Knee Pads for HC Frames - Wide',
-  'Replacement Knee Pads',
-  'Thermal Knee',
-  'Thermal Knee- 3 Layer TL-2',
-]);
-
-// LTO take-up sub-categories
-const LTO_TAKEUP_SUBS = new Set(['Add Velcr/Dring_TakeUps Opts', 'Take Up Strap Options']);
-
-// LTO pocket sub-categories
-const LTO_POCKET_SUBS = new Set([
-  'Additonal Options - Escape Pocket',
-  'Bellows Pocket Pairs (lined with Stedprene)',
-  'Single Bellows Pocket (Price includes Full Kevlar Lined',
-  'Single Bellows Pocket',
-  'Single XL Bellows Pocket (Price includes Full Kevlar Lined unless noted )',
-  'XL Bellows Pocket Sewn Flat (Price includes Full Kevlar Lined unless noted)',
-  'XL Bellows Pkt (pair) Sewn Flat (Price incl Full Kevlar Lined unless noted )',
-  'XL Bellows Pocket Sewn Flat',
-  'Miscellaneous Pockets & Options',
-]);
-const LTO_SUPPRESS = new Set([...LTO_KNEE_SUBS, ...LTO_TAKEUP_SUBS, ...LTO_POCKET_SUBS]);
-
-// PFP pocket sub-categories (mirror LTO structure for PFP)
-const PFP_POCKET_SUBS = new Set([
-  'Miscellaneous',
-  // PFP has fewer pocket categories; add any that appear
-]);
-const PFP_SUPPRESS = new Set([...PFP_POCKET_SUBS]);
-
 // Build ordered coat categories: priority first, then alphabetical minus suppressed
 function getCoatCategories(rawCats) {
   const prioritySet = new Set(COAT_PRIORITY);
@@ -196,39 +175,37 @@ function getCoatCategories(rawCats) {
   if (!pocketsInjected) result.push('__POCKETS__');
   return result;
 }
-function getLTOCategories(rawCats) {
-  // Priority: OS, TL, MB first
-  const priority = ['Outershell Material', 'Thermal Liner', 'Moisture Barrier'];
-  const prioritySet = new Set(priority);
-  const rest = rawCats
-    .filter((c) => !prioritySet.has(c) && !LTO_SUPPRESS.has(c) && c !== 'Take Up Straps')
-    .sort();
-  const result = [...priority];
-  const injected = new Set();
-  for (const c of rest) {
-    // Insert Knee Options before K-words
-    if (c[0] >= 'K' && !injected.has('__KNEES__')) {
-      result.push('__KNEES__');
-      injected.add('__KNEES__');
+
+// Pant categories (LTO + PFP) are grouped purely from the data itself: a
+// category string like "Knees: 3D Biflex knee" means "3D Biflex knee" is a
+// sub-accordion under a "Knees" parent. A category with no colon renders as
+// its own flat accordion. This replaces the old approach of hand-maintained
+// JS sets enumerating which category names belong under which synthetic
+// parent group -- the new catalog data already encodes that directly, so
+// adding/renaming a sub-option is just a CSV edit, no code change needed.
+const PANT_PRIORITY = ['Outershell', 'Thermal liner', 'Moisture barrier'];
+function buildPantCategoryTree(rawCats) {
+  const prioritySet = new Set(PANT_PRIORITY);
+  const byTop = {};
+  const topOrder = [];
+  rawCats.forEach((full) => {
+    const idx = full.indexOf(':');
+    const top = (idx === -1 ? full : full.slice(0, idx)).trim();
+    const sub = idx === -1 ? null : full.slice(idx + 1).trim();
+    if (!(top in byTop)) {
+      byTop[top] = [];
+      topOrder.push(top);
     }
-    // Insert Pockets before P-words
-    if (c[0] >= 'P' && !injected.has('__LTO_POCKETS__')) {
-      result.push('__LTO_POCKETS__');
-      injected.add('__LTO_POCKETS__');
-    }
-    // Insert Take Up Straps before T-words
-    if (c[0] >= 'T' && !injected.has('__TAKEUP__')) {
-      result.push('__TAKEUP__');
-      injected.add('__TAKEUP__');
-    }
-    result.push(c);
-  }
-  if (!injected.has('__KNEES__')) result.push('__KNEES__');
-  if (!injected.has('__LTO_POCKETS__')) result.push('__LTO_POCKETS__');
-  if (!injected.has('__TAKEUP__')) result.push('__TAKEUP__');
-  // Add suspenders at end
-  result.push('__SUSPENDERS__');
-  return result;
+    if (sub != null) byTop[top].push(sub);
+  });
+  const restTops = topOrder.filter((t) => !prioritySet.has(t)).sort();
+  const orderedTops = [...PANT_PRIORITY.filter((t) => t in byTop), ...restTops];
+  const tree = orderedTops.map((top) => ({
+    top,
+    subs: byTop[top].length ? [...new Set(byTop[top])].sort() : null,
+  }));
+  tree.push({ top: '__SUSPENDERS__', subs: null });
+  return tree;
 }
 
 // ─── QtySelector ──────────────────────────────────────────────────────────────────────────────
@@ -282,8 +259,9 @@ function QtySelector({ itemKey, qty, checked, onToggle, onQtyChange }) {
 
 // ─── ItemRow ────────────────────────────────────────────────────────────────────────────────────
 function ItemRow({ item, itemKey, checked, qty, onToggle, onQtyChange, showCategory }) {
-  const isTBD = item.price === 'TBD';
-  const price = parsePrice(item.price);
+  const grade = React.useContext(MaterialsGradeContext);
+  const price = resolveItemPrice(item, grade);
+  const isTBD = price == null;
   const desc = item.description && item.description !== '-' ? item.description : '';
   const diagramCtx = React.useContext(DiagramContext);
   const diagramMatch = item.sku && diagramCtx ? diagramCtx.lookupDiagram(item.sku) : null;
@@ -375,13 +353,14 @@ function CategoryAccordion({
   autoCollapseOnSelect,
 }) {
   const [open, setOpen] = React.useState(false);
+  const grade = React.useContext(MaterialsGradeContext);
   const selItems = items.filter((item) => selections[prefix + '||' + catName + '||' + item._gi]);
   const selCount = selItems.length;
   const catTotal = selItems.reduce((s, it) => {
     const k = prefix + '||' + catName + '||' + it._gi;
-    return s + (parsePrice(it.price) ?? 0) * (quantities[k] ?? 1);
+    return s + (resolveItemPrice(it, grade) ?? 0) * (quantities[k] ?? 1);
   }, 0);
-  const hasTBD = selItems.some((it) => it.price === 'TBD');
+  const hasTBD = selItems.some((it) => resolveItemPrice(it, grade) == null);
   const prevCountRef = React.useRef(0);
   React.useEffect(() => {
     if (autoCollapseOnSelect && selCount > 0 && prevCountRef.current === 0 && open) setOpen(false);
@@ -487,6 +466,7 @@ function ParentAccordion({
   search,
 }) {
   const [open, setOpen] = React.useState(false);
+  const grade = React.useContext(MaterialsGradeContext);
   const totalSel = subCats.reduce(
     (s, cat) =>
       s +
@@ -501,13 +481,14 @@ function ParentAccordion({
         .filter((it) => selections[prefix + '||' + cat + '||' + it._gi])
         .reduce((a, it) => {
           const k = prefix + '||' + cat + '||' + it._gi;
-          return a + (parsePrice(it.price) ?? 0) * (quantities[k] ?? 1);
+          return a + (resolveItemPrice(it, grade) ?? 0) * (quantities[k] ?? 1);
         }, 0),
     0,
   );
   const hasTBD = subCats.some((cat) =>
     (byCategory[cat] || []).some(
-      (it) => selections[prefix + '||' + cat + '||' + it._gi] && it.price === 'TBD',
+      (it) =>
+        selections[prefix + '||' + cat + '||' + it._gi] && resolveItemPrice(it, grade) == null,
     ),
   );
   const visibleSubs = subCats.filter((cat) => {
@@ -701,15 +682,17 @@ function PantPanel({
   onSuspToggle,
   onSuspQtyChange,
   suspEnabled,
+  materialsGrade,
+  onMaterialsGradeChange,
 }) {
   const data = CATALOG[pantType];
   if (!data) return null;
   const { items, categories } = data;
   // In PFP mode, the displayed item list is PFP's own items plus LTO's items
   // for any category PFP has no equivalent for -- one unified list, so the
-  // whole pants view reads as a single LTO-style accordion regardless of
-  // which pant type is active, just with PFP's own items substituted in
-  // wherever PFP has them.
+  // whole pants view reads as a single accordion regardless of which pant
+  // type is active, just with PFP's own items substituted in wherever PFP
+  // has them.
   const displayItems = React.useMemo(() => {
     if (pantType !== 'pfp') return items.map((item, gi) => ({ ...item, _gi: gi }));
     const ownItems = CATALOG.pfp.items.map((item, gi) => ({ ...item, _gi: gi }));
@@ -742,19 +725,17 @@ function PantPanel({
     });
     return map;
   }, [suspData]);
-  // PFP mode: order/group the union of LTO + PFP category names exactly the
-  // same way LTO's own category list is ordered and grouped (same priority,
-  // same Knee/Pockets/Take-Up accordions). PFP's "Miscellaneous" category is
-  // filtered out of the flat list here because it gets folded into the
-  // Pockets group below instead (mirroring how LTO's own pocket categories
-  // are grouped), so it doesn't also render as a separate flat entry.
-  const orderedCats = React.useMemo(() => {
-    if (pantType === 'lto') return getLTOCategories(categories);
-    const unionCats = [...new Set([...CATALOG.lto.categories, ...CATALOG.pfp.categories])].filter(
-      (c) => !PFP_SUPPRESS.has(c),
-    );
-    return getLTOCategories(unionCats);
+  // PFP mode: build the tree from the union of LTO + PFP category names, so
+  // PFP's own categories slot into the exact same alphabetical/grouped
+  // structure as LTO's, rather than appearing as a separate section.
+  const catTree = React.useMemo(() => {
+    const rawCats =
+      pantType === 'lto'
+        ? categories
+        : [...new Set([...CATALOG.lto.categories, ...CATALOG.pfp.categories])];
+    return buildPantCategoryTree(rawCats);
   }, [categories, pantType]);
+  const hasGradedItems = displayItems.some((it) => it.priceStd != null || it.pricePrm != null);
   const q = search.toLowerCase();
   if (search) {
     const matched = displayItems.filter(
@@ -776,55 +757,34 @@ function PantPanel({
   }
   return (
     <div className="space-y-1">
-      {orderedCats.map((cat) => {
-        if (cat === '__KNEES__')
-          return (
-            <ParentAccordion
-              key="__KNEES__"
-              title="Knee Options"
-              subCats={[...LTO_KNEE_SUBS]}
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="pant"
-              search={search}
-            />
-          );
-        if (cat === '__LTO_POCKETS__')
-          return (
-            <ParentAccordion
-              key="__LTO_POCKETS__"
-              title="Pockets"
-              subCats={
-                pantType === 'pfp' ? [...LTO_POCKET_SUBS, ...PFP_POCKET_SUBS] : [...LTO_POCKET_SUBS]
-              }
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="pant"
-              search={search}
-            />
-          );
-        if (cat === '__TAKEUP__')
-          return (
-            <ParentAccordion
-              key="__TAKEUP__"
-              title="Take Up Straps"
-              subCats={['Take Up Straps', ...LTO_TAKEUP_SUBS]}
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="pant"
-              search={search}
-            />
-          );
-        if (cat === '__SUSPENDERS__') {
+      {hasGradedItems && (
+        <div className="mb-3 flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-2">
+          <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">
+            Materials Grade
+          </span>
+          <div className="flex gap-2">
+            {[
+              { val: 'std', label: 'Standard' },
+              { val: 'prm', label: 'Premium' },
+            ].map((opt) => (
+              <button
+                key={opt.val}
+                onClick={() => onMaterialsGradeChange(opt.val)}
+                className={
+                  'px-3 py-1 rounded-md text-xs font-bold border-2 transition-all ' +
+                  (materialsGrade === opt.val
+                    ? 'text-blue-200 border-blue-500 bg-blue-900/60 shadow scale-105'
+                    : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500')
+                }
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {catTree.map(({ top, subs }) => {
+        if (top === '__SUSPENDERS__') {
           if (!suspData) return null;
           return (
             <div key="__SUSPENDERS__" className="mt-4">
@@ -879,12 +839,28 @@ function PantPanel({
             </div>
           );
         }
-        const catItems = byCategory[cat] || [];
+        if (subs) {
+          return (
+            <ParentAccordion
+              key={top}
+              title={top}
+              subCats={subs.map((s) => top + ': ' + s)}
+              byCategory={byCategory}
+              selections={selections}
+              quantities={quantities}
+              onToggle={onToggle}
+              onQtyChange={onQtyChange}
+              prefix="pant"
+              search={search}
+            />
+          );
+        }
+        const catItems = byCategory[top] || [];
         if (!catItems.length) return null;
         return (
           <CategoryAccordion
-            key={cat}
-            catName={cat}
+            key={top}
+            catName={top}
             items={catItems}
             selections={selections}
             quantities={quantities}
@@ -975,6 +951,7 @@ function OverviewPanel({
   discountPct,
   setDiscountPct,
 }) {
+  const grade = React.useContext(MaterialsGradeContext);
   const getItems = (source, prefix, sels, qtys) => {
     const data = CATALOG[source];
     if (!data) return [];
@@ -993,11 +970,13 @@ function OverviewPanel({
   const coatItems = getItems('coat', 'coat', coatSels, coatQtys);
   const pantItems = getCombinedPantItems(pantType, pantSels, pantQtys);
   const suspItems = suspEnabled ? getItems('suspenders', 'susp', suspSels, suspQtys) : [];
-  const coatTotal = coatItems.reduce((s, i) => s + (parsePrice(i.price) ?? 0) * i.qty, 0);
-  const pantTotal = pantItems.reduce((s, i) => s + (parsePrice(i.price) ?? 0) * i.qty, 0);
-  const suspTotal = suspItems.reduce((s, i) => s + (parsePrice(i.price) ?? 0) * i.qty, 0);
+  const coatTotal = coatItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
+  const pantTotal = pantItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
+  const suspTotal = suspItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
   const grandTotal = coatTotal + pantTotal + suspTotal;
-  const allTBD = [...coatItems, ...pantItems, ...suspItems].filter((i) => i.price === 'TBD');
+  const allTBD = [...coatItems, ...pantItems, ...suspItems].filter(
+    (i) => resolveItemPrice(i, grade) == null,
+  );
   const discountAmt = grandTotal * (discountPct / 100);
   const discountedTotal = grandTotal - discountAmt;
   const combinedPantItems = [...pantItems, ...suspItems];
@@ -1013,8 +992,8 @@ function OverviewPanel({
       ) : (
         <div className="divide-y divide-slate-700">
           {items.map((item, idx) => {
-            const isTBD = item.price === 'TBD';
-            const unitPrice = parsePrice(item.price);
+            const unitPrice = resolveItemPrice(item, grade);
+            const isTBD = unitPrice == null;
             const extPrice = unitPrice != null ? unitPrice * item.qty : null;
             return (
               <div key={idx} className="flex items-center justify-between px-4 py-2 text-xs">
@@ -1047,7 +1026,7 @@ function OverviewPanel({
             <span className="text-sm font-bold text-slate-300">Subtotal</span>
             <span className="text-sm font-bold text-emerald-400 font-mono">
               {fmtMoney(total)}
-              {items.some((i) => i.price === 'TBD') ? ' +TBD' : ''}
+              {items.some((i) => resolveItemPrice(i, grade) == null) ? ' +TBD' : ''}
             </span>
           </div>
         </div>
@@ -1153,6 +1132,7 @@ function generatePDF(
   discountPct,
   coatNotes,
   pantNotes,
+  materialsGrade,
 ) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({
@@ -1346,8 +1326,8 @@ function generatePDF(
       doc.text(String(qty), cQ, y + 3.8, {
         align: 'center',
       });
-      const isTBD = item.price === 'TBD';
-      const unitPrice = parsePrice(item.price);
+      const unitPrice = resolveItemPrice(item, materialsGrade);
+      const isTBD = unitPrice == null;
       const extPrice = unitPrice != null ? unitPrice * qty : null;
       if (isTBD) {
         doc.setTextColor(...AMBER);
@@ -1362,7 +1342,7 @@ function generatePDF(
       }
       y += 5.5;
     });
-    const tbdN = items.filter((i) => i.price === 'TBD').length;
+    const tbdN = items.filter((i) => resolveItemPrice(i, materialsGrade) == null).length;
     doc.setFillColor(...NAVY);
     doc.rect(M, y, W - M * 2, 7, 'F');
     doc.setFont('helvetica', 'bold');
@@ -1403,10 +1383,14 @@ function generatePDF(
     y = 46;
   }
   y += 4;
-  const allTBD = [...coatItems, ...pantItems, ...suspItems].filter((i) => i.price === 'TBD');
+  const allTBD = [...coatItems, ...pantItems, ...suspItems].filter(
+    (i) => resolveItemPrice(i, materialsGrade) == null,
+  );
+  const hasGraded = pantItems.some((it) => it.priceStd != null || it.pricePrm != null);
   let boxH = 20;
   if (discountPct > 0) boxH += 10;
   if (allTBD.length) boxH += 8;
+  if (hasGraded) boxH += 6;
   boxH += 8; // validity note
   doc.setFillColor(...NAVY);
   doc.roundedRect(M, y, W - M * 2, boxH, 3, 3, 'F');
@@ -1420,6 +1404,19 @@ function generatePDF(
     align: 'right',
   });
   let noteY = y + 18;
+  if (hasGraded) {
+    doc.setFontSize(8);
+    doc.setTextColor(180, 200, 230);
+    doc.setFont('helvetica', 'italic');
+    doc.text(
+      'Pant pricing reflects ' +
+        (materialsGrade === 'prm' ? 'Premium' : 'Standard') +
+        ' materials grade.',
+      M + 4,
+      noteY,
+    );
+    noteY += 6;
+  }
   if (discountPct > 0) {
     const discAmt = grandTotal * (discountPct / 100),
       discTotal = grandTotal - discAmt;
@@ -1556,6 +1553,7 @@ function App() {
   const [tab, setTab] = React.useState('coat');
   const [pantType, setPantType] = React.useState('');
   const [suspEnabled, setSuspEnabled] = React.useState(false);
+  const [materialsGrade, setMaterialsGrade] = React.useState('std');
   const [coatSels, setCoatSels] = React.useState({});
   const [pantSelsLTO, setPantSelsLTO] = React.useState({});
   const [pantSelsPFP, setPantSelsPFP] = React.useState({});
@@ -1839,10 +1837,10 @@ function App() {
   const pantTotal = React.useMemo(() => {
     if (!pantType) return 0;
     return getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys).reduce(
-      (s, it) => s + (parsePrice(it.price) ?? 0) * it.qty,
+      (s, it) => s + (resolveItemPrice(it, materialsGrade) ?? 0) * it.qty,
       0,
     );
-  }, [pantType, mergedPantSels, mergedPantQtys]);
+  }, [pantType, mergedPantSels, mergedPantQtys, materialsGrade]);
   const suspTotal = React.useMemo(
     () =>
       suspEnabled
@@ -1870,6 +1868,7 @@ function App() {
     setSuspQtys({});
     setPantType('');
     setSuspEnabled(false);
+    setMaterialsGrade('std');
     setTab('coat');
     setSearch('');
     setQuoteInfo({
@@ -1928,6 +1927,7 @@ function App() {
       discountPct,
       coatNotes,
       pantNotes,
+      materialsGrade,
     );
   };
   React.useMemo(() => {
@@ -1939,159 +1939,101 @@ function App() {
   }, []);
   return (
     <DiagramContext.Provider value={diagramCtxValue}>
-      <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
-        <header className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 border-b border-slate-700 shadow-xl">
-          <div className="max-w-7xl mx-auto px-4 py-4">
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-              <div className="flex items-center gap-4">
-                <div className="w-20 h-16 bg-white rounded-lg flex items-center justify-center overflow-hidden shadow-lg border border-slate-600 p-1">
-                  <img
-                    src={MP_LOGO_B64}
-                    alt="Morning Pride"
-                    className="w-full h-full object-contain"
-                  />
-                </div>
-                <div>
-                  <div className="text-xs font-bold tracking-widest text-red-400 uppercase">
-                    Morning Pride
+      <MaterialsGradeContext.Provider value={materialsGrade}>
+        <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
+          <header className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 border-b border-slate-700 shadow-xl">
+            <div className="max-w-7xl mx-auto px-4 py-4">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="w-20 h-16 bg-white rounded-lg flex items-center justify-center overflow-hidden shadow-lg border border-slate-600 p-1">
+                    <img
+                      src={MP_LOGO_B64}
+                      alt="Morning Pride"
+                      className="w-full h-full object-contain"
+                    />
                   </div>
-                  <h1 className="text-xl sm:text-2xl font-black text-white leading-tight">
-                    Turnout Gear <span className="text-red-500">Builder</span>
-                  </h1>
-                  <div className="text-xs text-slate-400 mt-0.5">
-                    Horizon Turnout Gear — Authorized Distributor
+                  <div>
+                    <div className="text-xs font-bold tracking-widest text-red-400 uppercase">
+                      Morning Pride
+                    </div>
+                    <h1 className="text-xl sm:text-2xl font-black text-white leading-tight">
+                      Turnout Gear <span className="text-red-500">Builder</span>
+                    </h1>
+                    <div className="text-xs text-slate-400 mt-0.5">
+                      Horizon Turnout Gear — Authorized Distributor
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div className="bg-slate-800/80 border border-slate-600 rounded-xl px-5 py-3 min-w-[220px]">
-                <div className="text-xs text-slate-400 uppercase tracking-wider mb-1">
-                  Running Total
-                </div>
-                <div className="text-2xl font-black text-white font-mono">
-                  {fmtMoney(grandTotal)}
-                </div>
-                <div className="flex justify-between text-xs mt-1 text-slate-400">
-                  <span>
-                    Coat: <span className="text-blue-300 font-mono">{fmtMoney(coatTotal)}</span>
-                  </span>
-                  <span>
-                    Pants: <span className="text-purple-300 font-mono">{fmtMoney(pantTotal)}</span>
-                  </span>
-                  {suspEnabled && (
+                <div className="bg-slate-800/80 border border-slate-600 rounded-xl px-5 py-3 min-w-[220px]">
+                  <div className="text-xs text-slate-400 uppercase tracking-wider mb-1">
+                    Running Total
+                  </div>
+                  <div className="text-2xl font-black text-white font-mono">
+                    {fmtMoney(grandTotal)}
+                  </div>
+                  <div className="flex justify-between text-xs mt-1 text-slate-400">
                     <span>
-                      Susp:{' '}
-                      <span className="text-emerald-300 font-mono">{fmtMoney(suspTotal)}</span>
+                      Coat: <span className="text-blue-300 font-mono">{fmtMoney(coatTotal)}</span>
                     </span>
-                  )}
-                </div>
-                <div className="flex gap-3 text-xs mt-1 text-slate-500">
-                  {coatCount > 0 && <span>{coatCount} coat</span>}
-                  {pantCount > 0 && <span>{pantCount} pant</span>}
-                  {suspEnabled && suspCount > 0 && <span>{suspCount} susp</span>}
+                    <span>
+                      Pants:{' '}
+                      <span className="text-purple-300 font-mono">{fmtMoney(pantTotal)}</span>
+                    </span>
+                    {suspEnabled && (
+                      <span>
+                        Susp:{' '}
+                        <span className="text-emerald-300 font-mono">{fmtMoney(suspTotal)}</span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-3 text-xs mt-1 text-slate-500">
+                    {coatCount > 0 && <span>{coatCount} coat</span>}
+                    {pantCount > 0 && <span>{pantCount} pant</span>}
+                    {suspEnabled && suspCount > 0 && <span>{suspCount} susp</span>}
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        </header>
-        <div className="bg-slate-900 border-b border-slate-700 sticky top-0 z-10 shadow-lg">
-          <div className="max-w-7xl mx-auto px-4">
-            <div className="flex gap-1 pt-2">
-              {[
-                {
-                  id: 'coat',
-                  label: '\uD83E\uDDE5  Coat',
-                },
-                {
-                  id: 'pant',
-                  label: '\uD83D\uDC56  Pants',
-                },
-                {
-                  id: 'overview',
-                  label: '\uD83D\uDCCB  Overview',
-                },
-              ].map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => {
-                    setTab(t.id);
-                    setSearch('');
-                  }}
-                  className={
-                    'px-4 sm:px-6 py-2.5 text-sm font-semibold rounded-t-lg transition-all border-b-2 ' +
-                    (tab === t.id
-                      ? 'bg-blue-900/60 border-red-500 text-white'
-                      : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/50')
-                  }
-                >
-                  {t.label}
-                </button>
-              ))}
+          </header>
+          <div className="bg-slate-900 border-b border-slate-700 sticky top-0 z-10 shadow-lg">
+            <div className="max-w-7xl mx-auto px-4">
+              <div className="flex gap-1 pt-2">
+                {[
+                  {
+                    id: 'coat',
+                    label: '\uD83E\uDDE5  Coat',
+                  },
+                  {
+                    id: 'pant',
+                    label: '\uD83D\uDC56  Pants',
+                  },
+                  {
+                    id: 'overview',
+                    label: '\uD83D\uDCCB  Overview',
+                  },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => {
+                      setTab(t.id);
+                      setSearch('');
+                    }}
+                    className={
+                      'px-4 sm:px-6 py-2.5 text-sm font-semibold rounded-t-lg transition-all border-b-2 ' +
+                      (tab === t.id
+                        ? 'bg-blue-900/60 border-red-500 text-white'
+                        : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/50')
+                    }
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
-        <main className="max-w-7xl mx-auto px-4 py-6">
-          {tab === 'coat' && (
-            <React.Fragment>
-              <div className="mb-4">
-                <input
-                  type="text"
-                  placeholder="Search SKUs or descriptions\u2026"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                />
-              </div>
-              <CoatPanel
-                selections={coatSels}
-                quantities={coatQtys}
-                onToggle={handleCoatToggle}
-                onQtyChange={handleCoatQty}
-                search={search}
-              />
-            </React.Fragment>
-          )}
-          {tab === 'pant' && (
-            <React.Fragment>
-              <div className="mb-5 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
-                <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">
-                  Select Pant Type
-                </div>
-                <div className="flex gap-3 flex-wrap">
-                  {[
-                    {
-                      id: 'lto',
-                      label: 'LTO Pant',
-                      active: 'text-blue-300 border-blue-500 bg-blue-900/60',
-                    },
-                    {
-                      id: 'pfp',
-                      label: 'PFP Pant',
-                      active: 'text-purple-300 border-purple-500 bg-purple-900/60',
-                    },
-                  ].map((opt) => (
-                    <button
-                      key={opt.id}
-                      onClick={() => handlePantTypeChange(opt.id)}
-                      className={
-                        'flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold border-2 transition-all ' +
-                        (pantType === opt.id
-                          ? opt.active + ' shadow-lg scale-105'
-                          : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-200')
-                      }
-                    >
-                      <span
-                        className={
-                          'w-2.5 h-2.5 rounded-full ' +
-                          (pantType === opt.id ? 'bg-current' : 'bg-slate-600')
-                        }
-                      />
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {pantType && <MismatchBanner cats={mismatchCats} />}
-              {pantType && (
+          <main className="max-w-7xl mx-auto px-4 py-6">
+            {tab === 'coat' && (
+              <React.Fragment>
                 <div className="mb-4">
                   <input
                     type="text"
@@ -2101,168 +2043,233 @@ function App() {
                     className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
                   />
                 </div>
-              )}
-              {pantType && (
-                <PantPanel
-                  pantType={pantType}
-                  selections={mergedPantSels}
-                  quantities={mergedPantQtys}
-                  onToggle={handlePantToggle}
-                  onQtyChange={handlePantQty}
+                <CoatPanel
+                  selections={coatSels}
+                  quantities={coatQtys}
+                  onToggle={handleCoatToggle}
+                  onQtyChange={handleCoatQty}
                   search={search}
-                  suspSels={suspSels}
-                  suspQtys={suspQtys}
-                  onSuspToggle={handleSuspToggle}
-                  onSuspQtyChange={handleSuspQty}
-                  suspEnabled={suspEnabled}
                 />
-              )}
-            </React.Fragment>
-          )}
-          {tab === 'overview' && (
-            <React.Fragment>
-              <div className="mb-6 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
-                <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">
-                  Quote Information — Appears on PDF
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {[
-                    {
-                      key: 'dealer',
-                      label: 'Dealer / Distributor',
-                      ph: 'e.g. Horizon Turnout Gear',
-                    },
-                    {
-                      key: 'salesman',
-                      label: 'Salesman',
-                      ph: 'e.g. Steve Smith',
-                    },
-                    {
-                      key: 'department',
-                      label: 'Department / Organization',
-                      ph: 'e.g. Orange County Fire Rescue',
-                    },
-                    {
-                      key: 'date',
-                      label: 'Quote Date',
-                      ph: 'e.g. June 14, 2026',
-                    },
-                  ].map((f) => (
-                    <div key={f.key}>
-                      <label className="block text-xs text-slate-400 mb-1">{f.label}</label>
-                      <input
-                        type="text"
-                        value={quoteInfo[f.key]}
-                        onChange={(e) =>
-                          setQuoteInfo((p) => ({
-                            ...p,
-                            [f.key]: e.target.value,
-                          }))
+              </React.Fragment>
+            )}
+            {tab === 'pant' && (
+              <React.Fragment>
+                <div className="mb-5 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
+                  <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">
+                    Select Pant Type
+                  </div>
+                  <div className="flex gap-3 flex-wrap">
+                    {[
+                      {
+                        id: 'lto',
+                        label: 'LTO Pant',
+                        active: 'text-blue-300 border-blue-500 bg-blue-900/60',
+                      },
+                      {
+                        id: 'pfp',
+                        label: 'PFP Pant',
+                        active: 'text-purple-300 border-purple-500 bg-purple-900/60',
+                      },
+                    ].map((opt) => (
+                      <button
+                        key={opt.id}
+                        onClick={() => handlePantTypeChange(opt.id)}
+                        className={
+                          'flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold border-2 transition-all ' +
+                          (pantType === opt.id
+                            ? opt.active + ' shadow-lg scale-105'
+                            : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-200')
                         }
-                        placeholder={f.ph}
-                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+                      >
+                        <span
+                          className={
+                            'w-2.5 h-2.5 rounded-full ' +
+                            (pantType === opt.id ? 'bg-current' : 'bg-slate-600')
+                          }
+                        />
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {pantType && <MismatchBanner cats={mismatchCats} />}
+                {pantType && (
+                  <div className="mb-4">
+                    <input
+                      type="text"
+                      placeholder="Search SKUs or descriptions\u2026"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+                )}
+                {pantType && (
+                  <PantPanel
+                    pantType={pantType}
+                    selections={mergedPantSels}
+                    quantities={mergedPantQtys}
+                    onToggle={handlePantToggle}
+                    onQtyChange={handlePantQty}
+                    search={search}
+                    suspSels={suspSels}
+                    suspQtys={suspQtys}
+                    onSuspToggle={handleSuspToggle}
+                    onSuspQtyChange={handleSuspQty}
+                    suspEnabled={suspEnabled}
+                    materialsGrade={materialsGrade}
+                    onMaterialsGradeChange={setMaterialsGrade}
+                  />
+                )}
+              </React.Fragment>
+            )}
+            {tab === 'overview' && (
+              <React.Fragment>
+                <div className="mb-6 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
+                  <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">
+                    Quote Information — Appears on PDF
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {[
+                      {
+                        key: 'dealer',
+                        label: 'Dealer / Distributor',
+                        ph: 'e.g. Horizon Turnout Gear',
+                      },
+                      {
+                        key: 'salesman',
+                        label: 'Salesman',
+                        ph: 'e.g. Steve Smith',
+                      },
+                      {
+                        key: 'department',
+                        label: 'Department / Organization',
+                        ph: 'e.g. Orange County Fire Rescue',
+                      },
+                      {
+                        key: 'date',
+                        label: 'Quote Date',
+                        ph: 'e.g. June 14, 2026',
+                      },
+                    ].map((f) => (
+                      <div key={f.key}>
+                        <label className="block text-xs text-slate-400 mb-1">{f.label}</label>
+                        <input
+                          type="text"
+                          value={quoteInfo[f.key]}
+                          onChange={(e) =>
+                            setQuoteInfo((p) => ({
+                              ...p,
+                              [f.key]: e.target.value,
+                            }))
+                          }
+                          placeholder={f.ph}
+                          className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-slate-700">
+                    <label className="block text-xs text-slate-400 mb-1">Discount Percentage</label>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.5"
+                        value={discountPct || ''}
+                        onChange={(e) =>
+                          setDiscountPct(
+                            Math.max(0, Math.min(100, parseFloat(e.target.value) || 0)),
+                          )
+                        }
+                        placeholder="0"
+                        className="w-28 bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                      />
+                      <span className="text-sm text-slate-400">%</span>
+                      {discountPct > 0 && (
+                        <span className="text-xs text-emerald-400">
+                          Discount will be applied to the grand total
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-slate-700 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Coat Customization Notes
+                      </label>
+                      <textarea
+                        value={coatNotes}
+                        onChange={(e) => setCoatNotes(e.target.value)}
+                        placeholder="Special instructions for coat construction\u2026"
+                        rows={3}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
                       />
                     </div>
-                  ))}
-                </div>
-                <div className="mt-3 pt-3 border-t border-slate-700">
-                  <label className="block text-xs text-slate-400 mb-1">Discount Percentage</label>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      step="0.5"
-                      value={discountPct || ''}
-                      onChange={(e) =>
-                        setDiscountPct(Math.max(0, Math.min(100, parseFloat(e.target.value) || 0)))
-                      }
-                      placeholder="0"
-                      className="w-28 bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
-                    />
-                    <span className="text-sm text-slate-400">%</span>
-                    {discountPct > 0 && (
-                      <span className="text-xs text-emerald-400">
-                        Discount will be applied to the grand total
-                      </span>
-                    )}
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Pant Customization Notes
+                      </label>
+                      <textarea
+                        value={pantNotes}
+                        onChange={(e) => setPantNotes(e.target.value)}
+                        placeholder="Special instructions for pant construction\u2026"
+                        rows={3}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
+                      />
+                    </div>
                   </div>
                 </div>
-                <div className="mt-3 pt-3 border-t border-slate-700 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">
-                      Coat Customization Notes
-                    </label>
-                    <textarea
-                      value={coatNotes}
-                      onChange={(e) => setCoatNotes(e.target.value)}
-                      placeholder="Special instructions for coat construction\u2026"
-                      rows={3}
-                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">
-                      Pant Customization Notes
-                    </label>
-                    <textarea
-                      value={pantNotes}
-                      onChange={(e) => setPantNotes(e.target.value)}
-                      placeholder="Special instructions for pant construction\u2026"
-                      rows={3}
-                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
-                    />
-                  </div>
+                <OverviewPanel
+                  coatSels={coatSels}
+                  coatQtys={coatQtys}
+                  pantSels={mergedPantSels}
+                  pantQtys={mergedPantQtys}
+                  pantType={pantType || 'lto'}
+                  suspSels={suspSels}
+                  suspQtys={suspQtys}
+                  suspEnabled={suspEnabled}
+                  onGeneratePDF={handleGeneratePDF}
+                  onReset={() => setShowReset(true)}
+                  discountPct={discountPct}
+                  setDiscountPct={setDiscountPct}
+                />
+              </React.Fragment>
+            )}
+          </main>
+          {showReset && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+              <div className="bg-slate-800 border border-slate-600 rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+                <h2 className="text-lg font-bold text-white mb-2">Reset Quote?</h2>
+                <p className="text-slate-400 text-sm mb-5">
+                  This will clear all selections, quantities, and quote information. This cannot be
+                  undone.
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleReset}
+                    className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 rounded-lg transition-colors"
+                  >
+                    Yes, Reset
+                  </button>
+                  <button
+                    onClick={() => setShowReset(false)}
+                    className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold py-2.5 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
                 </div>
-              </div>
-              <OverviewPanel
-                coatSels={coatSels}
-                coatQtys={coatQtys}
-                pantSels={mergedPantSels}
-                pantQtys={mergedPantQtys}
-                pantType={pantType || 'lto'}
-                suspSels={suspSels}
-                suspQtys={suspQtys}
-                suspEnabled={suspEnabled}
-                onGeneratePDF={handleGeneratePDF}
-                onReset={() => setShowReset(true)}
-                discountPct={discountPct}
-                setDiscountPct={setDiscountPct}
-              />
-            </React.Fragment>
-          )}
-        </main>
-        {showReset && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
-            <div className="bg-slate-800 border border-slate-600 rounded-2xl p-6 max-w-sm w-full shadow-2xl">
-              <h2 className="text-lg font-bold text-white mb-2">Reset Quote?</h2>
-              <p className="text-slate-400 text-sm mb-5">
-                This will clear all selections, quantities, and quote information. This cannot be
-                undone.
-              </p>
-              <div className="flex gap-3">
-                <button
-                  onClick={handleReset}
-                  className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 rounded-lg transition-colors"
-                >
-                  Yes, Reset
-                </button>
-                <button
-                  onClick={() => setShowReset(false)}
-                  className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold py-2.5 rounded-lg transition-colors"
-                >
-                  Cancel
-                </button>
               </div>
             </div>
-          </div>
-        )}
-        <DiagramModal
-          modal={diagramModal}
-          onClose={closeDiagram}
-          onSelectPage={selectDiagramPage}
-        />
-      </div>
+          )}
+          <DiagramModal
+            modal={diagramModal}
+            onClose={closeDiagram}
+            onSelectPage={selectDiagramPage}
+          />
+        </div>
+      </MaterialsGradeContext.Provider>
     </DiagramContext.Provider>
   );
 }
