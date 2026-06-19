@@ -268,7 +268,7 @@ function ItemRow({
   isPremium = false,
   onGradeToggle = () => {},
 }) {
-  const isGraded = item.priceStd != null || item.pricePrm != null;
+  const isGraded = item.priceStd != null && item.pricePrm != null;
   const price = resolveItemPrice(item, isGraded && isPremium ? 'prm' : 'std');
   const isTBD = price == null;
   const desc = item.description && item.description !== '-' ? item.description : '';
@@ -376,7 +376,7 @@ function CategoryAccordion({
 }) {
   const [open, setOpen] = React.useState(false);
   const gradeFor = (it, k) =>
-    (it.priceStd != null || it.pricePrm != null) && grades[k] ? 'prm' : 'std';
+    (it.priceStd != null && it.pricePrm != null) && grades[k] ? 'prm' : 'std';
   const selItems = items.filter((item) => selections[prefix + '||' + catName + '||' + item._gi]);
   const selCount = selItems.length;
   const catTotal = selItems.reduce((s, it) => {
@@ -508,7 +508,7 @@ function ParentAccordion({
 }) {
   const [open, setOpen] = React.useState(false);
   const gradeFor = (it, k) =>
-    (it.priceStd != null || it.pricePrm != null) && grades[k] ? 'prm' : 'std';
+    (it.priceStd != null && it.pricePrm != null) && grades[k] ? 'prm' : 'std';
   const totalSel = subCats.reduce(
     (s, cat) =>
       s +
@@ -1024,7 +1024,7 @@ function OverviewPanel({
       ) : (
         <div className="divide-y divide-slate-700">
           {items.map((item, idx) => {
-            const isGraded = item.priceStd != null || item.pricePrm != null;
+            const isGraded = item.priceStd != null && item.pricePrm != null;
             const unitPrice = resolveItemPrice(item, item.grade || 'std');
             const isTBD = unitPrice == null;
             const extPrice = unitPrice != null ? unitPrice * item.qty : null;
@@ -1373,7 +1373,7 @@ function generatePDF(
       const unitPrice = resolveItemPrice(item, item.grade || 'std');
       const isTBD = unitPrice == null;
       const extPrice = unitPrice != null ? unitPrice * qty : null;
-      const isGraded = item.priceStd != null || item.pricePrm != null;
+      const isGraded = item.priceStd != null && item.pricePrm != null;
       const gradeTag = isGraded ? (item.grade === 'prm' ? ' (Prm)' : ' (Std)') : '';
       if (isTBD) {
         doc.setTextColor(...AMBER);
@@ -1432,7 +1432,7 @@ function generatePDF(
   const allTBD = [...coatItems, ...pantItems, ...suspItems].filter(
     (i) => resolveItemPrice(i, i.grade || 'std') == null,
   );
-  const hasGraded = pantItems.some((it) => it.priceStd != null || it.pricePrm != null);
+  const hasGraded = pantItems.some((it) => it.priceStd != null && it.pricePrm != null);
   let boxH = 20;
   if (discountPct > 0) boxH += 10;
   if (allTBD.length) boxH += 8;
