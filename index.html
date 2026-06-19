@@ -59,6 +59,18 @@ const resolveItemPrice = (item, grade) => {
   }
   return parsePrice(item.price);
 };
+// Many cleaned-catalog items share an identical display SKU (a single "New
+// Kit #" can cover several color/material variants, or simply wasn't
+// re-coded item-by-item) while the original "Legacy Kit #" stays unique per
+// row. Appending it in parentheses whenever it differs from the SKU is what
+// lets someone tell two otherwise-identical-looking rows apart.
+const skuLabel = item => {
+  const sku = item.sku || '';
+  if (item.legacySku && item.legacySku !== item.sku) {
+    return sku ? sku + ' (' + item.legacySku + ')' : item.legacySku;
+  }
+  return sku;
+};
 const MATCH_CATS = new Set(['Outershell Material', 'Moisture Barrier', 'Thermal Liner']);
 
 // ─── PFP/LTO Pant Merge ───────────────────────────────────────────────────────
@@ -293,9 +305,9 @@ function ItemRow({
     onClick: () => diagramCtx.openDiagram(item.sku),
     title: 'View diagram — manual page ' + diagramMatch.pages[0] + (diagramMatch.pages.length > 1 ? ' (+' + (diagramMatch.pages.length - 1) + ' more)' : ''),
     className: "text-xs font-mono font-bold text-blue-300 hover:text-blue-200 cursor-pointer"
-  }, item.sku) : /*#__PURE__*/React.createElement("span", {
+  }, skuLabel(item)) : /*#__PURE__*/React.createElement("span", {
     className: "text-xs font-mono text-blue-300"
-  }, item.sku)), desc && /*#__PURE__*/React.createElement("span", {
+  }, skuLabel(item))), desc && /*#__PURE__*/React.createElement("span", {
     className: "text-sm text-slate-200"
   }, desc)), isGraded && /*#__PURE__*/React.createElement("label", {
     className: "flex items-center gap-1.5 mt-1 text-xs text-purple-300 cursor-pointer select-none w-fit"
@@ -454,7 +466,7 @@ function ParentAccordion({
     if (!items.length) return false;
     if (!search) return true;
     const q = search.toLowerCase();
-    return items.some(it => (it.sku || '').toLowerCase().includes(q) || (it.description || '').toLowerCase().includes(q));
+    return items.some(it => (it.sku || '').toLowerCase().includes(q) || (it.legacySku || '').toLowerCase().includes(q) || (it.description || '').toLowerCase().includes(q));
   });
   if (!visibleSubs.length) return null;
   return /*#__PURE__*/React.createElement("div", {
@@ -530,7 +542,7 @@ function CoatPanel({
     const matched = items.map((item, gi) => ({
       ...item,
       _gi: gi
-    })).filter(item => (item.sku || '').toLowerCase().includes(q) || (item.description || '').toLowerCase().includes(q) || (item.category || '').toLowerCase().includes(q));
+    })).filter(item => (item.sku || '').toLowerCase().includes(q) || (item.legacySku || '').toLowerCase().includes(q) || (item.description || '').toLowerCase().includes(q) || (item.category || '').toLowerCase().includes(q));
     return /*#__PURE__*/React.createElement(SearchResultsPanel, {
       items: matched,
       selections: selections,
@@ -672,7 +684,7 @@ function PantPanel({
   }, [categories, pantType]);
   const q = search.toLowerCase();
   if (search) {
-    const matched = displayItems.filter(item => (item.sku || '').toLowerCase().includes(q) || (item.description || '').toLowerCase().includes(q) || (item.category || '').toLowerCase().includes(q));
+    const matched = displayItems.filter(item => (item.sku || '').toLowerCase().includes(q) || (item.legacySku || '').toLowerCase().includes(q) || (item.description || '').toLowerCase().includes(q) || (item.category || '').toLowerCase().includes(q));
     return /*#__PURE__*/React.createElement(SearchResultsPanel, {
       items: matched,
       selections: selections,
@@ -885,7 +897,7 @@ function OverviewPanel({
       className: "flex items-center gap-2"
     }, item.sku && /*#__PURE__*/React.createElement("div", {
       className: "text-blue-400 font-mono"
-    }, item.sku), isGraded && /*#__PURE__*/React.createElement("span", {
+    }, skuLabel(item)), isGraded && /*#__PURE__*/React.createElement("span", {
       className: 'text-[10px] font-bold uppercase tracking-wide ' + (item.grade === 'prm' ? 'text-purple-400' : 'text-slate-500')
     }, item.grade === 'prm' ? 'Premium' : 'Standard'))), /*#__PURE__*/React.createElement("div", {
       className: "flex items-center gap-2 flex-shrink-0"
@@ -1101,7 +1113,7 @@ function generatePDF(coatItems, pantItems, pantType, suspItems, coatTotal, pantT
     doc.setTextColor(...WHITE);
     const cC = M + 2,
       cS = M + 30,
-      cD = M + 52,
+      cD = M + 70,
       cQ = W - M - 28,
       cP = W - M - 2;
     doc.text('CATEGORY', cC, y + 4.5);
@@ -1129,7 +1141,7 @@ function generatePDF(coatItems, pantItems, pantType, suspItems, coatTotal, pantT
       doc.text((item.category || '').substring(0, 18), cC, y + 3.8);
       doc.setFont('courier', 'normal');
       doc.setTextColor(30, 60, 120);
-      doc.text((item.sku || '').substring(0, 12), cS, y + 3.8);
+      doc.text(skuLabel(item).substring(0, 26), cS, y + 3.8);
       doc.setFont('helvetica', 'normal');
       doc.setTextColor(40, 50, 70);
       doc.text((item.description || item.sku || '').substring(0, 44), cD, y + 3.8);

@@ -32,6 +32,18 @@ const resolveItemPrice = (item, grade) => {
   }
   return parsePrice(item.price);
 };
+// Many cleaned-catalog items share an identical display SKU (a single "New
+// Kit #" can cover several color/material variants, or simply wasn't
+// re-coded item-by-item) while the original "Legacy Kit #" stays unique per
+// row. Appending it in parentheses whenever it differs from the SKU is what
+// lets someone tell two otherwise-identical-looking rows apart.
+const skuLabel = (item) => {
+  const sku = item.sku || '';
+  if (item.legacySku && item.legacySku !== item.sku) {
+    return sku ? sku + ' (' + item.legacySku + ')' : item.legacySku;
+  }
+  return sku;
+};
 const MATCH_CATS = new Set(['Outershell Material', 'Moisture Barrier', 'Thermal Liner']);
 
 // ─── PFP/LTO Pant Merge ───────────────────────────────────────────────────────
@@ -313,10 +325,10 @@ function ItemRow({
                 }
                 className="text-xs font-mono font-bold text-blue-300 hover:text-blue-200 cursor-pointer"
               >
-                {item.sku}
+                {skuLabel(item)}
               </button>
             ) : (
-              <span className="text-xs font-mono text-blue-300">{item.sku}</span>
+              <span className="text-xs font-mono text-blue-300">{skuLabel(item)}</span>
             ))}
           {desc && <span className="text-sm text-slate-200">{desc}</span>}
         </div>
@@ -541,6 +553,7 @@ function ParentAccordion({
     return items.some(
       (it) =>
         (it.sku || '').toLowerCase().includes(q) ||
+        (it.legacySku || '').toLowerCase().includes(q) ||
         (it.description || '').toLowerCase().includes(q),
     );
   });
@@ -631,6 +644,7 @@ function CoatPanel({ selections, quantities, onToggle, onQtyChange, search }) {
       .filter(
         (item) =>
           (item.sku || '').toLowerCase().includes(q) ||
+          (item.legacySku || '').toLowerCase().includes(q) ||
           (item.description || '').toLowerCase().includes(q) ||
           (item.category || '').toLowerCase().includes(q),
       );
@@ -784,6 +798,7 @@ function PantPanel({
     const matched = displayItems.filter(
       (item) =>
         (item.sku || '').toLowerCase().includes(q) ||
+        (item.legacySku || '').toLowerCase().includes(q) ||
         (item.description || '').toLowerCase().includes(q) ||
         (item.category || '').toLowerCase().includes(q),
     );
@@ -1036,7 +1051,7 @@ function OverviewPanel({
                     {item.description || item.sku}
                   </div>
                   <div className="flex items-center gap-2">
-                    {item.sku && <div className="text-blue-400 font-mono">{item.sku}</div>}
+                    {item.sku && <div className="text-blue-400 font-mono">{skuLabel(item)}</div>}
                     {isGraded && (
                       <span
                         className={
@@ -1332,7 +1347,7 @@ function generatePDF(
     doc.setTextColor(...WHITE);
     const cC = M + 2,
       cS = M + 30,
-      cD = M + 52,
+      cD = M + 70,
       cQ = W - M - 28,
       cP = W - M - 2;
     doc.text('CATEGORY', cC, y + 4.5);
@@ -1360,7 +1375,7 @@ function generatePDF(
       doc.text((item.category || '').substring(0, 18), cC, y + 3.8);
       doc.setFont('courier', 'normal');
       doc.setTextColor(30, 60, 120);
-      doc.text((item.sku || '').substring(0, 12), cS, y + 3.8);
+      doc.text(skuLabel(item).substring(0, 26), cS, y + 3.8);
       doc.setFont('helvetica', 'normal');
       doc.setTextColor(40, 50, 70);
       doc.text((item.description || item.sku || '').substring(0, 44), cD, y + 3.8);
