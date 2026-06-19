@@ -44,7 +44,7 @@ const skuLabel = (item) => {
   }
   return sku;
 };
-const MATCH_CATS = new Set(['Outershell Material', 'Moisture Barrier', 'Thermal Liner']);
+const MATCH_CATS = new Set(['Outer Shell', 'Moisture Barrier', 'Thermal Liner']);
 
 // ─── PFP/LTO Pant Merge ───────────────────────────────────────────────────────
 // LTO pant categories that have no exact-name equivalent in PFP. When PFP is
@@ -98,93 +98,35 @@ function buildNormalizedMap(raw) {
 const DiagramContext = React.createContext(null);
 
 // ─── Category ordering & nesting config ──────────────────────────────────────
-// For coat: OS → TL → MB first, then rest alphabetical
-// Layer order: Outershell Material, Thermal Liner, Moisture Barrier
-const COAT_PRIORITY = ['Outershell Material', 'Thermal Liner', 'Moisture Barrier'];
+// Coat priority layer order: Outer Shell → Thermal Liner → Moisture Barrier,
+// then the rest alphabetical. These three names must match MATCH_CATS below
+// exactly, since they're also the categories the coat/pant material-match
+// feature keys off.
+const COAT_PRIORITY = ['Outer Shell', 'Thermal Liner', 'Moisture Barrier'];
 
-// Coat pocket sub-categories (nested under "Pockets" parent)
-const COAT_POCKET_SUBS = new Set([
-  'Pockets',
-  'Tool Divider Opts',
-  'Handwarmer w Bellows Option',
-  'Liner Pkt In Bellows Opts',
-  'Tool Pouch',
-  'EZ Grip Flap',
-  "Lining/Reinf Mat'l",
-  'Velcro Add Ons Bellows',
-  'Custom Snap Opts',
-  'Handwarmer Pockets',
-  'Patch Pockets',
-  'Radio Pockets',
-  'Radio Pocket Options',
-  'Internal Cell Pocket',
-  'Flashlight Pocket',
-  'Airmask Pocket Options',
-  'Misc Pockets and Options',
-  'Undershield Pockets',
-  'Bandolero Pocket',
-  'Escape Canister',
-  'Tool Holders',
-  'Flat Tool Pocket',
-  'Knife Pouch',
-  'Cutting Tool Holder',
-  'Notebook Pocket',
-  'Shield Pocket Options',
-]);
-
-// DRD sub-categories
-const DRD_SUBS = new Set([
-  'DRD Garage',
-  'DRD Ropes Installed in New Coat',
-  'Drag Rescue Devices - Shipped Loose',
-  'DRD Handle Opts',
-]);
-
-// Chinstrap sub-categories
-const CHINSTRAP_SUBS = new Set(['Chinstrap Velcro Add On Opts']);
-
-// Coat: categories to suppress from top-level (they live under a parent)
-const COAT_SUPPRESS = new Set([
-  ...COAT_POCKET_SUBS,
-  ...DRD_SUBS,
-  ...CHINSTRAP_SUBS,
-  'Chinstraps',
-  // rendered as parent via __CHINSTRAPS__ synthetic key
-  'Belt Loops', // moved to pants
-]);
-
-// Build ordered coat categories: priority first, then alphabetical minus suppressed
-function getCoatCategories(rawCats) {
+// Coat categories are grouped the same way Pants are: a category string like
+// "Chinstraps: LTO Chinstrap" means "LTO Chinstrap" is a sub-accordion under
+// a "Chinstraps" parent, with no hand-maintained JS sets needed.
+function buildCoatCategoryTree(rawCats) {
   const prioritySet = new Set(COAT_PRIORITY);
-  // Rest = all non-priority, non-suppressed categories, sorted alphabetically
-  const rest = rawCats.filter((c) => !prioritySet.has(c) && !COAT_SUPPRESS.has(c)).sort();
-  const result = [...COAT_PRIORITY];
-  let chinInjected = false,
-    drdInjected = false,
-    pocketsInjected = false;
-  for (const c of rest) {
-    // Inject __CHINSTRAPS__ before the first category that sorts after 'Ch'
-    // 'Chinstraps' itself is suppressed so we key off the next alphabetical item
-    if (!chinInjected && c >= 'Cl') {
-      result.push('__CHINSTRAPS__');
-      chinInjected = true;
+  const byTop = {};
+  const topOrder = [];
+  rawCats.forEach((full) => {
+    const idx = full.indexOf(':');
+    const top = (idx === -1 ? full : full.slice(0, idx)).trim();
+    const sub = idx === -1 ? null : full.slice(idx + 1).trim();
+    if (!(top in byTop)) {
+      byTop[top] = [];
+      topOrder.push(top);
     }
-    // Inject __DRD__ before first category starting with E or later (D-words suppressed)
-    if (!drdInjected && c >= 'E') {
-      result.push('__DRD__');
-      drdInjected = true;
-    }
-    // Inject __POCKETS__ before first category starting with Q or later (P-words suppressed)
-    if (!pocketsInjected && c >= 'Q') {
-      result.push('__POCKETS__');
-      pocketsInjected = true;
-    }
-    result.push(c);
-  }
-  if (!chinInjected) result.push('__CHINSTRAPS__');
-  if (!drdInjected) result.push('__DRD__');
-  if (!pocketsInjected) result.push('__POCKETS__');
-  return result;
+    if (sub != null) byTop[top].push(sub);
+  });
+  const restTops = topOrder.filter((t) => !prioritySet.has(t)).sort();
+  const orderedTops = [...COAT_PRIORITY.filter((t) => t in byTop), ...restTops];
+  return orderedTops.map((top) => ({
+    top,
+    subs: byTop[top].length ? [...new Set(byTop[top])].sort() : null,
+  }));
 }
 
 // Pant categories (LTO + PFP) are grouped purely from the data itself: a
@@ -618,36 +560,29 @@ function ParentAccordion({
 }
 
 // ─── CoatPanel ────────────────────────────────────────────────────────────────────────────────────
-function CoatPanel({ selections, quantities, onToggle, onQtyChange, search }) {
+function CoatPanel({ selections, quantities, onToggle, onQtyChange, search, grades, onGradeToggle }) {
   const data = CATALOG.coat;
   if (!data) return null;
   const { items, categories } = data;
+  const displayItems = React.useMemo(() => items.map((item, gi) => ({ ...item, _gi: gi })), [items]);
   const byCategory = React.useMemo(() => {
     const map = {};
-    items.forEach((item, gi) => {
+    displayItems.forEach((item) => {
       if (!map[item.category]) map[item.category] = [];
-      map[item.category].push({
-        ...item,
-        _gi: gi,
-      });
+      map[item.category].push(item);
     });
     return map;
-  }, [items]);
-  const orderedCats = React.useMemo(() => getCoatCategories(categories), [categories]);
+  }, [displayItems]);
+  const catTree = React.useMemo(() => buildCoatCategoryTree(categories), [categories]);
   const q = search.toLowerCase();
   if (search) {
-    const matched = items
-      .map((item, gi) => ({
-        ...item,
-        _gi: gi,
-      }))
-      .filter(
-        (item) =>
-          (item.sku || '').toLowerCase().includes(q) ||
-          (item.legacySku || '').toLowerCase().includes(q) ||
-          (item.description || '').toLowerCase().includes(q) ||
-          (item.category || '').toLowerCase().includes(q),
-      );
+    const matched = displayItems.filter(
+      (item) =>
+        (item.sku || '').toLowerCase().includes(q) ||
+        (item.legacySku || '').toLowerCase().includes(q) ||
+        (item.description || '').toLowerCase().includes(q) ||
+        (item.category || '').toLowerCase().includes(q),
+    );
     return (
       <SearchResultsPanel
         items={matched}
@@ -656,18 +591,20 @@ function CoatPanel({ selections, quantities, onToggle, onQtyChange, search }) {
         onToggle={onToggle}
         onQtyChange={onQtyChange}
         prefix="coat"
+        grades={grades}
+        onGradeToggle={onGradeToggle}
       />
     );
   }
   return (
     <div className="space-y-1">
-      {orderedCats.map((cat) => {
-        if (cat === '__CHINSTRAPS__')
+      {catTree.map(({ top, subs }) => {
+        if (subs) {
           return (
             <ParentAccordion
-              key="__CHINSTRAPS__"
-              title="Chinstraps"
-              subCats={['Chinstraps', ...CHINSTRAP_SUBS]}
+              key={top}
+              title={top}
+              subCats={subs.map((s) => top + ': ' + s)}
               byCategory={byCategory}
               selections={selections}
               quantities={quantities}
@@ -675,51 +612,26 @@ function CoatPanel({ selections, quantities, onToggle, onQtyChange, search }) {
               onQtyChange={onQtyChange}
               prefix="coat"
               search={search}
+              grades={grades}
+              onGradeToggle={onGradeToggle}
             />
           );
-        if (cat === '__DRD__')
-          return (
-            <ParentAccordion
-              key="__DRD__"
-              title="DRD \u2014 Drag Rescue Device"
-              subCats={[...DRD_SUBS]}
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="coat"
-              search={search}
-            />
-          );
-        if (cat === '__POCKETS__')
-          return (
-            <ParentAccordion
-              key="__POCKETS__"
-              title="Pockets & Accessories"
-              subCats={[...COAT_POCKET_SUBS]}
-              byCategory={byCategory}
-              selections={selections}
-              quantities={quantities}
-              onToggle={onToggle}
-              onQtyChange={onQtyChange}
-              prefix="coat"
-              search={search}
-            />
-          );
-        const catItems = byCategory[cat] || [];
+        }
+        const catItems = byCategory[top] || [];
         if (!catItems.length) return null;
         return (
           <CategoryAccordion
-            key={cat}
-            catName={cat}
+            key={top}
+            catName={top}
             items={catItems}
             selections={selections}
             quantities={quantities}
             onToggle={onToggle}
             onQtyChange={onQtyChange}
             prefix="coat"
-            autoCollapseOnSelect={COAT_PRIORITY.includes(cat)}
+            autoCollapseOnSelect={COAT_PRIORITY.includes(top)}
+            grades={grades}
+            onGradeToggle={onGradeToggle}
           />
         );
       })}
@@ -978,6 +890,7 @@ function MismatchBanner({ cats }) {
 function OverviewPanel({
   coatSels,
   coatQtys,
+  coatGrades,
   pantSels,
   pantQtys,
   pantGrades,
@@ -990,7 +903,7 @@ function OverviewPanel({
   discountPct,
   setDiscountPct,
 }) {
-  const getItems = (source, prefix, sels, qtys) => {
+  const getItems = (source, prefix, sels, qtys, grades = {}) => {
     const data = CATALOG[source];
     if (!data) return [];
     return data.items.flatMap((item, i) => {
@@ -1000,12 +913,13 @@ function OverviewPanel({
             {
               ...item,
               qty: qtys[key] ?? 1,
+              grade: grades[key] ? 'prm' : 'std',
             },
           ]
         : [];
     });
   };
-  const coatItems = getItems('coat', 'coat', coatSels, coatQtys);
+  const coatItems = getItems('coat', 'coat', coatSels, coatQtys, coatGrades);
   const pantItems = getCombinedPantItems(pantType, pantSels, pantQtys, pantGrades);
   const suspItems = suspEnabled ? getItems('suspenders', 'susp', suspSels, suspQtys) : [];
   const coatTotal = coatItems.reduce(
@@ -1630,6 +1544,9 @@ function App() {
   const [itemGradesLTO, setItemGradesLTO] = React.useState({});
   const [itemGradesPFP, setItemGradesPFP] = React.useState({});
   const [itemGradesShared, setItemGradesShared] = React.useState({});
+  // Coat's graded items live in a single flat array (no LTO/PFP mode split),
+  // so this is just one pool, same shape as the pant grade maps above.
+  const [itemGradesCoat, setItemGradesCoat] = React.useState({});
   const [search, setSearch] = React.useState('');
   const [showReset, setShowReset] = React.useState(false);
   const [quoteInfo, setQuoteInfo] = React.useState({
@@ -1829,6 +1746,14 @@ function App() {
       })),
     [],
   );
+  const handleCoatGradeToggle = React.useCallback(
+    (k) =>
+      setItemGradesCoat((p) => ({
+        ...p,
+        [k]: !p[k],
+      })),
+    [],
+  );
   const handlePantToggle = React.useCallback(
     (k) => {
       const cat = k.split('||')[1];
@@ -1919,9 +1844,10 @@ function App() {
     () =>
       CATALOG.coat.items.reduce((s, it, i) => {
         const k = 'coat||' + it.category + '||' + i;
-        return s + (coatSels[k] ? (parsePrice(it.price) ?? 0) * (coatQtys[k] ?? 1) : 0);
+        const grade = itemGradesCoat[k] ? 'prm' : 'std';
+        return s + (coatSels[k] ? (resolveItemPrice(it, grade) ?? 0) * (coatQtys[k] ?? 1) : 0);
       }, 0),
-    [coatSels, coatQtys],
+    [coatSels, coatQtys, itemGradesCoat],
   );
   const pantTotal = React.useMemo(() => {
     if (!pantType) return 0;
@@ -1985,6 +1911,7 @@ function App() {
             {
               ...it,
               qty: coatQtys[k] ?? 1,
+              grade: itemGradesCoat[k] ? 'prm' : 'std',
             },
           ]
         : [];
@@ -2138,6 +2065,8 @@ function App() {
                   onToggle={handleCoatToggle}
                   onQtyChange={handleCoatQty}
                   search={search}
+                  grades={itemGradesCoat}
+                  onGradeToggle={handleCoatGradeToggle}
                 />
               </React.Fragment>
             )}
@@ -2313,6 +2242,7 @@ function App() {
                 <OverviewPanel
                   coatSels={coatSels}
                   coatQtys={coatQtys}
+                  coatGrades={itemGradesCoat}
                   pantSels={mergedPantSels}
                   pantQtys={mergedPantQtys}
                   pantGrades={mergedItemGrades}
