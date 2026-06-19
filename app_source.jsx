@@ -45,18 +45,22 @@ const LTO_ONLY_PANT_CATEGORIES = (() => {
 
 // Builds the combined list of selected+priced pant items for totals/Overview/PDF:
 // the pant type's own selected items, plus (when PFP is active) any selected
-// items from the LTO-only fallback categories.
-function getCombinedPantItems(pantType, sels, qtys) {
+// items from the LTO-only fallback categories. Each item gets a `.grade`
+// ('std' | 'prm') attached from the per-item grades map, since pricing is now
+// chosen per item rather than from one global toggle.
+function getCombinedPantItems(pantType, sels, qtys, grades = {}) {
   const own = ((CATALOG[pantType] && CATALOG[pantType].items) || []).flatMap((item, i) => {
     const key = 'pant||' + item.category + '||' + i;
-    return sels[key] ? [{ ...item, qty: qtys[key] ?? 1 }] : [];
+    return sels[key] ? [{ ...item, qty: qtys[key] ?? 1, grade: grades[key] ? 'prm' : 'std' }] : [];
   });
   const extra =
     pantType === 'pfp'
       ? CATALOG.lto.items.flatMap((item, i) => {
           if (!LTO_ONLY_PANT_CATEGORIES.has(item.category)) return [];
           const key = 'pant||' + item.category + '||' + i;
-          return sels[key] ? [{ ...item, qty: qtys[key] ?? 1 }] : [];
+          return sels[key]
+            ? [{ ...item, qty: qtys[key] ?? 1, grade: grades[key] ? 'prm' : 'std' }]
+            : [];
         })
       : [];
   return [...own, ...extra];
@@ -80,11 +84,6 @@ function buildNormalizedMap(raw) {
   return out;
 }
 const DiagramContext = React.createContext(null);
-// Holds the currently-selected materials grade ('std' | 'prm') so deeply
-// nested pant-rendering components (ItemRow, CategoryAccordion,
-// ParentAccordion) can resolve the correct price without prop-drilling it
-// through every intermediate component.
-const MaterialsGradeContext = React.createContext('std');
 
 // ─── Category ordering & nesting config ──────────────────────────────────────
 // For coat: OS → TL → MB first, then rest alphabetical
@@ -258,9 +257,19 @@ function QtySelector({ itemKey, qty, checked, onToggle, onQtyChange }) {
 }
 
 // ─── ItemRow ────────────────────────────────────────────────────────────────────────────────────
-function ItemRow({ item, itemKey, checked, qty, onToggle, onQtyChange, showCategory }) {
-  const grade = React.useContext(MaterialsGradeContext);
-  const price = resolveItemPrice(item, grade);
+function ItemRow({
+  item,
+  itemKey,
+  checked,
+  qty,
+  onToggle,
+  onQtyChange,
+  showCategory,
+  isPremium = false,
+  onGradeToggle = () => {},
+}) {
+  const isGraded = item.priceStd != null || item.pricePrm != null;
+  const price = resolveItemPrice(item, isGraded && isPremium ? 'prm' : 'std');
   const isTBD = price == null;
   const desc = item.description && item.description !== '-' ? item.description : '';
   const diagramCtx = React.useContext(DiagramContext);
@@ -311,6 +320,17 @@ function ItemRow({ item, itemKey, checked, qty, onToggle, onQtyChange, showCateg
             ))}
           {desc && <span className="text-sm text-slate-200">{desc}</span>}
         </div>
+        {isGraded && (
+          <label className="flex items-center gap-1.5 mt-1 text-xs text-purple-300 cursor-pointer select-none w-fit">
+            <input
+              type="checkbox"
+              checked={isPremium}
+              onChange={() => onGradeToggle(itemKey)}
+              className="w-3.5 h-3.5 accent-purple-500 cursor-pointer"
+            />
+            Use Premium Material
+          </label>
+        )}
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
         <QtySelector
@@ -351,16 +371,22 @@ function CategoryAccordion({
   onQtyChange,
   prefix,
   autoCollapseOnSelect,
+  grades = {},
+  onGradeToggle = () => {},
 }) {
   const [open, setOpen] = React.useState(false);
-  const grade = React.useContext(MaterialsGradeContext);
+  const gradeFor = (it, k) =>
+    (it.priceStd != null || it.pricePrm != null) && grades[k] ? 'prm' : 'std';
   const selItems = items.filter((item) => selections[prefix + '||' + catName + '||' + item._gi]);
   const selCount = selItems.length;
   const catTotal = selItems.reduce((s, it) => {
     const k = prefix + '||' + catName + '||' + it._gi;
-    return s + (resolveItemPrice(it, grade) ?? 0) * (quantities[k] ?? 1);
+    return s + (resolveItemPrice(it, gradeFor(it, k)) ?? 0) * (quantities[k] ?? 1);
   }, 0);
-  const hasTBD = selItems.some((it) => resolveItemPrice(it, grade) == null);
+  const hasTBD = selItems.some((it) => {
+    const k = prefix + '||' + catName + '||' + it._gi;
+    return resolveItemPrice(it, gradeFor(it, k)) == null;
+  });
   const prevCountRef = React.useRef(0);
   React.useEffect(() => {
     if (autoCollapseOnSelect && selCount > 0 && prevCountRef.current === 0 && open) setOpen(false);
@@ -419,6 +445,8 @@ function CategoryAccordion({
                 onToggle={onToggle}
                 onQtyChange={onQtyChange}
                 showCategory={false}
+                isPremium={!!grades[key]}
+                onGradeToggle={onGradeToggle}
               />
             );
           })}
@@ -429,7 +457,16 @@ function CategoryAccordion({
 }
 
 // ─── SearchResultsPanel ────────────────────────────────────────────────────────────────────────────────────
-function SearchResultsPanel({ items, selections, quantities, onToggle, onQtyChange, prefix }) {
+function SearchResultsPanel({
+  items,
+  selections,
+  quantities,
+  onToggle,
+  onQtyChange,
+  prefix,
+  grades = {},
+  onGradeToggle = () => {},
+}) {
   if (!items.length)
     return <p className="text-slate-500 text-sm text-center py-8">No options match your search.</p>;
   return (
@@ -446,6 +483,8 @@ function SearchResultsPanel({ items, selections, quantities, onToggle, onQtyChan
             onToggle={onToggle}
             onQtyChange={onQtyChange}
             showCategory={true}
+            isPremium={!!grades[key]}
+            onGradeToggle={onGradeToggle}
           />
         );
       })}
@@ -464,9 +503,12 @@ function ParentAccordion({
   onQtyChange,
   prefix,
   search,
+  grades = {},
+  onGradeToggle = () => {},
 }) {
   const [open, setOpen] = React.useState(false);
-  const grade = React.useContext(MaterialsGradeContext);
+  const gradeFor = (it, k) =>
+    (it.priceStd != null || it.pricePrm != null) && grades[k] ? 'prm' : 'std';
   const totalSel = subCats.reduce(
     (s, cat) =>
       s +
@@ -481,15 +523,15 @@ function ParentAccordion({
         .filter((it) => selections[prefix + '||' + cat + '||' + it._gi])
         .reduce((a, it) => {
           const k = prefix + '||' + cat + '||' + it._gi;
-          return a + (resolveItemPrice(it, grade) ?? 0) * (quantities[k] ?? 1);
+          return a + (resolveItemPrice(it, gradeFor(it, k)) ?? 0) * (quantities[k] ?? 1);
         }, 0),
     0,
   );
   const hasTBD = subCats.some((cat) =>
-    (byCategory[cat] || []).some(
-      (it) =>
-        selections[prefix + '||' + cat + '||' + it._gi] && resolveItemPrice(it, grade) == null,
-    ),
+    (byCategory[cat] || []).some((it) => {
+      const k = prefix + '||' + cat + '||' + it._gi;
+      return selections[k] && resolveItemPrice(it, gradeFor(it, k)) == null;
+    }),
   );
   const visibleSubs = subCats.filter((cat) => {
     const items = byCategory[cat] || [];
@@ -552,6 +594,8 @@ function ParentAccordion({
               onQtyChange={onQtyChange}
               prefix={prefix}
               autoCollapseOnSelect={false}
+              grades={grades}
+              onGradeToggle={onGradeToggle}
             />
           ))}
         </div>
@@ -682,8 +726,8 @@ function PantPanel({
   onSuspToggle,
   onSuspQtyChange,
   suspEnabled,
-  materialsGrade,
-  onMaterialsGradeChange,
+  grades,
+  onGradeToggle,
 }) {
   const data = CATALOG[pantType];
   if (!data) return null;
@@ -735,7 +779,6 @@ function PantPanel({
         : [...new Set([...CATALOG.lto.categories, ...CATALOG.pfp.categories])];
     return buildPantCategoryTree(rawCats);
   }, [categories, pantType]);
-  const hasGradedItems = displayItems.some((it) => it.priceStd != null || it.pricePrm != null);
   const q = search.toLowerCase();
   if (search) {
     const matched = displayItems.filter(
@@ -752,37 +795,13 @@ function PantPanel({
         onToggle={onToggle}
         onQtyChange={onQtyChange}
         prefix="pant"
+        grades={grades}
+        onGradeToggle={onGradeToggle}
       />
     );
   }
   return (
     <div className="space-y-1">
-      {hasGradedItems && (
-        <div className="mb-3 flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-2">
-          <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">
-            Materials Grade
-          </span>
-          <div className="flex gap-2">
-            {[
-              { val: 'std', label: 'Standard' },
-              { val: 'prm', label: 'Premium' },
-            ].map((opt) => (
-              <button
-                key={opt.val}
-                onClick={() => onMaterialsGradeChange(opt.val)}
-                className={
-                  'px-3 py-1 rounded-md text-xs font-bold border-2 transition-all ' +
-                  (materialsGrade === opt.val
-                    ? 'text-blue-200 border-blue-500 bg-blue-900/60 shadow scale-105'
-                    : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500')
-                }
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
       {catTree.map(({ top, subs }) => {
         if (top === '__SUSPENDERS__') {
           if (!suspData) return null;
@@ -852,6 +871,8 @@ function PantPanel({
               onQtyChange={onQtyChange}
               prefix="pant"
               search={search}
+              grades={grades}
+              onGradeToggle={onGradeToggle}
             />
           );
         }
@@ -868,6 +889,8 @@ function PantPanel({
             onQtyChange={onQtyChange}
             prefix="pant"
             autoCollapseOnSelect={false}
+            grades={grades}
+            onGradeToggle={onGradeToggle}
           />
         );
       })}
@@ -942,6 +965,7 @@ function OverviewPanel({
   coatQtys,
   pantSels,
   pantQtys,
+  pantGrades,
   pantType,
   suspSels,
   suspQtys,
@@ -951,7 +975,6 @@ function OverviewPanel({
   discountPct,
   setDiscountPct,
 }) {
-  const grade = React.useContext(MaterialsGradeContext);
   const getItems = (source, prefix, sels, qtys) => {
     const data = CATALOG[source];
     if (!data) return [];
@@ -968,14 +991,23 @@ function OverviewPanel({
     });
   };
   const coatItems = getItems('coat', 'coat', coatSels, coatQtys);
-  const pantItems = getCombinedPantItems(pantType, pantSels, pantQtys);
+  const pantItems = getCombinedPantItems(pantType, pantSels, pantQtys, pantGrades);
   const suspItems = suspEnabled ? getItems('suspenders', 'susp', suspSels, suspQtys) : [];
-  const coatTotal = coatItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
-  const pantTotal = pantItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
-  const suspTotal = suspItems.reduce((s, i) => s + (resolveItemPrice(i, grade) ?? 0) * i.qty, 0);
+  const coatTotal = coatItems.reduce(
+    (s, i) => s + (resolveItemPrice(i, i.grade || 'std') ?? 0) * i.qty,
+    0,
+  );
+  const pantTotal = pantItems.reduce(
+    (s, i) => s + (resolveItemPrice(i, i.grade || 'std') ?? 0) * i.qty,
+    0,
+  );
+  const suspTotal = suspItems.reduce(
+    (s, i) => s + (resolveItemPrice(i, i.grade || 'std') ?? 0) * i.qty,
+    0,
+  );
   const grandTotal = coatTotal + pantTotal + suspTotal;
   const allTBD = [...coatItems, ...pantItems, ...suspItems].filter(
-    (i) => resolveItemPrice(i, grade) == null,
+    (i) => resolveItemPrice(i, i.grade || 'std') == null,
   );
   const discountAmt = grandTotal * (discountPct / 100);
   const discountedTotal = grandTotal - discountAmt;
@@ -992,7 +1024,8 @@ function OverviewPanel({
       ) : (
         <div className="divide-y divide-slate-700">
           {items.map((item, idx) => {
-            const unitPrice = resolveItemPrice(item, grade);
+            const isGraded = item.priceStd != null || item.pricePrm != null;
+            const unitPrice = resolveItemPrice(item, item.grade || 'std');
             const isTBD = unitPrice == null;
             const extPrice = unitPrice != null ? unitPrice * item.qty : null;
             return (
@@ -1002,7 +1035,19 @@ function OverviewPanel({
                   <div className="text-slate-100 font-medium truncate">
                     {item.description || item.sku}
                   </div>
-                  {item.sku && <div className="text-blue-400 font-mono">{item.sku}</div>}
+                  <div className="flex items-center gap-2">
+                    {item.sku && <div className="text-blue-400 font-mono">{item.sku}</div>}
+                    {isGraded && (
+                      <span
+                        className={
+                          'text-[10px] font-bold uppercase tracking-wide ' +
+                          (item.grade === 'prm' ? 'text-purple-400' : 'text-slate-500')
+                        }
+                      >
+                        {item.grade === 'prm' ? 'Premium' : 'Standard'}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className="flex items-center gap-2 flex-shrink-0">
                   {item.qty > 1 && (
@@ -1026,7 +1071,7 @@ function OverviewPanel({
             <span className="text-sm font-bold text-slate-300">Subtotal</span>
             <span className="text-sm font-bold text-emerald-400 font-mono">
               {fmtMoney(total)}
-              {items.some((i) => resolveItemPrice(i, grade) == null) ? ' +TBD' : ''}
+              {items.some((i) => resolveItemPrice(i, i.grade || 'std') == null) ? ' +TBD' : ''}
             </span>
           </div>
         </div>
@@ -1132,7 +1177,6 @@ function generatePDF(
   discountPct,
   coatNotes,
   pantNotes,
-  materialsGrade,
 ) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({
@@ -1326,23 +1370,25 @@ function generatePDF(
       doc.text(String(qty), cQ, y + 3.8, {
         align: 'center',
       });
-      const unitPrice = resolveItemPrice(item, materialsGrade);
+      const unitPrice = resolveItemPrice(item, item.grade || 'std');
       const isTBD = unitPrice == null;
       const extPrice = unitPrice != null ? unitPrice * qty : null;
+      const isGraded = item.priceStd != null || item.pricePrm != null;
+      const gradeTag = isGraded ? (item.grade === 'prm' ? ' (Prm)' : ' (Std)') : '';
       if (isTBD) {
         doc.setTextColor(...AMBER);
-        doc.text('TBD', cP, y + 3.8, {
+        doc.text('TBD' + gradeTag, cP, y + 3.8, {
           align: 'right',
         });
       } else {
         doc.setTextColor(20, 120, 60);
-        doc.text(fmtMoney(extPrice), cP, y + 3.8, {
+        doc.text(fmtMoney(extPrice) + gradeTag, cP, y + 3.8, {
           align: 'right',
         });
       }
       y += 5.5;
     });
-    const tbdN = items.filter((i) => resolveItemPrice(i, materialsGrade) == null).length;
+    const tbdN = items.filter((i) => resolveItemPrice(i, i.grade || 'std') == null).length;
     doc.setFillColor(...NAVY);
     doc.rect(M, y, W - M * 2, 7, 'F');
     doc.setFont('helvetica', 'bold');
@@ -1384,7 +1430,7 @@ function generatePDF(
   }
   y += 4;
   const allTBD = [...coatItems, ...pantItems, ...suspItems].filter(
-    (i) => resolveItemPrice(i, materialsGrade) == null,
+    (i) => resolveItemPrice(i, i.grade || 'std') == null,
   );
   const hasGraded = pantItems.some((it) => it.priceStd != null || it.pricePrm != null);
   let boxH = 20;
@@ -1409,9 +1455,7 @@ function generatePDF(
     doc.setTextColor(180, 200, 230);
     doc.setFont('helvetica', 'italic');
     doc.text(
-      'Pant pricing reflects ' +
-        (materialsGrade === 'prm' ? 'Premium' : 'Standard') +
-        ' materials grade.',
+      '(Std) / (Prm) next to a pant price reflects that item\u2019s selected materials grade.',
       M + 4,
       noteY,
     );
@@ -1553,7 +1597,6 @@ function App() {
   const [tab, setTab] = React.useState('coat');
   const [pantType, setPantType] = React.useState('');
   const [suspEnabled, setSuspEnabled] = React.useState(false);
-  const [materialsGrade, setMaterialsGrade] = React.useState('std');
   const [coatSels, setCoatSels] = React.useState({});
   const [pantSelsLTO, setPantSelsLTO] = React.useState({});
   const [pantSelsPFP, setPantSelsPFP] = React.useState({});
@@ -1564,6 +1607,14 @@ function App() {
   const [pantQtysPFP, setPantQtysPFP] = React.useState({});
   const [pantQtysShared, setPantQtysShared] = React.useState({});
   const [suspQtys, setSuspQtys] = React.useState({});
+  // Per-item materials grade for graded LTO/PFP pant items ('std' is the
+  // default/missing state; `true` in these maps means "use Premium"). Mirrors
+  // the LTO/PFP/shared split used for pantSels/pantQtys above, since a graded
+  // item's key lives in exactly one of those three pools depending on whether
+  // its category is mode-specific or an LTO-only fallback.
+  const [itemGradesLTO, setItemGradesLTO] = React.useState({});
+  const [itemGradesPFP, setItemGradesPFP] = React.useState({});
+  const [itemGradesShared, setItemGradesShared] = React.useState({});
   const [search, setSearch] = React.useState('');
   const [showReset, setShowReset] = React.useState(false);
   const [quoteInfo, setQuoteInfo] = React.useState({
@@ -1682,6 +1733,8 @@ function App() {
   const setCurrentPantSels = pantType === 'lto' ? setPantSelsLTO : setPantSelsPFP;
   const currentPantQtys = pantType === 'lto' ? pantQtysLTO : pantQtysPFP;
   const setCurrentPantQtys = pantType === 'lto' ? setPantQtysLTO : setPantQtysPFP;
+  const currentItemGrades = pantType === 'lto' ? itemGradesLTO : itemGradesPFP;
+  const setCurrentItemGrades = pantType === 'lto' ? setItemGradesLTO : setItemGradesPFP;
   // Merged view used for rendering/totals: the shared LTO-only-fallback pool
   // (same regardless of LTO/PFP) plus whichever per-mode pool is active.
   // Key namespaces never collide -- a category lives in exactly one of the two.
@@ -1692,6 +1745,10 @@ function App() {
   const mergedPantQtys = React.useMemo(
     () => ({ ...pantQtysShared, ...currentPantQtys }),
     [pantQtysShared, currentPantQtys],
+  );
+  const mergedItemGrades = React.useMemo(
+    () => ({ ...itemGradesShared, ...currentItemGrades }),
+    [itemGradesShared, currentItemGrades],
   );
   React.useEffect(() => {
     if (!pantType) return;
@@ -1802,6 +1859,23 @@ function App() {
     },
     [setCurrentPantQtys],
   );
+  const handleGradeToggle = React.useCallback(
+    (k) => {
+      const cat = k.split('||')[1];
+      if (LTO_ONLY_PANT_CATEGORIES.has(cat)) {
+        setItemGradesShared((p) => ({
+          ...p,
+          [k]: !p[k],
+        }));
+      } else {
+        setCurrentItemGrades((p) => ({
+          ...p,
+          [k]: !p[k],
+        }));
+      }
+    },
+    [setCurrentItemGrades],
+  );
   const handleSuspToggle = React.useCallback(
     (k) =>
       setSuspSels((p) => ({
@@ -1836,11 +1910,11 @@ function App() {
   );
   const pantTotal = React.useMemo(() => {
     if (!pantType) return 0;
-    return getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys).reduce(
-      (s, it) => s + (resolveItemPrice(it, materialsGrade) ?? 0) * it.qty,
+    return getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, mergedItemGrades).reduce(
+      (s, it) => s + (resolveItemPrice(it, it.grade) ?? 0) * it.qty,
       0,
     );
-  }, [pantType, mergedPantSels, mergedPantQtys, materialsGrade]);
+  }, [pantType, mergedPantSels, mergedPantQtys, mergedItemGrades]);
   const suspTotal = React.useMemo(
     () =>
       suspEnabled
@@ -1866,9 +1940,11 @@ function App() {
     setPantQtysPFP({});
     setPantQtysShared({});
     setSuspQtys({});
+    setItemGradesLTO({});
+    setItemGradesPFP({});
+    setItemGradesShared({});
     setPantType('');
     setSuspEnabled(false);
-    setMaterialsGrade('std');
     setTab('coat');
     setSearch('');
     setQuoteInfo({
@@ -1899,7 +1975,7 @@ function App() {
         : [];
     });
     const pantItems = pantType
-      ? getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys)
+      ? getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, mergedItemGrades)
       : [];
     const suspItems = suspEnabled
       ? CATALOG.suspenders.items.flatMap((it, i) => {
@@ -1927,7 +2003,6 @@ function App() {
       discountPct,
       coatNotes,
       pantNotes,
-      materialsGrade,
     );
   };
   React.useMemo(() => {
@@ -1939,7 +2014,6 @@ function App() {
   }, []);
   return (
     <DiagramContext.Provider value={diagramCtxValue}>
-      <MaterialsGradeContext.Provider value={materialsGrade}>
         <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
           <header className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 border-b border-slate-700 shadow-xl">
             <div className="max-w-7xl mx-auto px-4 py-4">
@@ -2117,8 +2191,8 @@ function App() {
                     onSuspToggle={handleSuspToggle}
                     onSuspQtyChange={handleSuspQty}
                     suspEnabled={suspEnabled}
-                    materialsGrade={materialsGrade}
-                    onMaterialsGradeChange={setMaterialsGrade}
+                    grades={mergedItemGrades}
+                    onGradeToggle={handleGradeToggle}
                   />
                 )}
               </React.Fragment>
@@ -2226,6 +2300,7 @@ function App() {
                   coatQtys={coatQtys}
                   pantSels={mergedPantSels}
                   pantQtys={mergedPantQtys}
+                  pantGrades={mergedItemGrades}
                   pantType={pantType || 'lto'}
                   suspSels={suspSels}
                   suspQtys={suspQtys}
@@ -2269,7 +2344,6 @@ function App() {
             onSelectPage={selectDiagramPage}
           />
         </div>
-      </MaterialsGradeContext.Provider>
     </DiagramContext.Provider>
   );
 }
