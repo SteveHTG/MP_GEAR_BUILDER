@@ -46,6 +46,93 @@ const skuLabel = (item) => {
 };
 const MATCH_CATS = new Set(['Outer Shell', 'Moisture Barrier', 'Thermal Liner']);
 
+// ─── Materials grade auto-detection from the outer-shell model code ────────────
+// The materials grade (Standard vs Premium) of every priced option item is no
+// longer a manual per-item toggle: it is derived from the selected OUTER SHELL.
+// Each outer-shell SKU encodes a 2-digit model code right after "OS"
+// (e.g. LTOTOS12B -> "12"). For PFP the public sku is a generic code ("PFPOS"),
+// so the model lives in the legacy sku instead (MPLPOS12B -> "12"). Premium vs
+// standard is decided purely by that code per the Morning Pride price sheet.
+// Rule: if ANY selected outer shell on a garment is premium, that garment's
+// option items all price at premium ("premium wins"); otherwise standard.
+// Nothing selected -> standard. A rep can still override any single item.
+const PREMIUM_SHELL_MODELS = new Set(['12', '38', '48', '62', '72', '80', '96']);
+const STANDARD_SHELL_MODELS = new Set(['14', '17', '39', '53', '56', '75', '85', '86', '89']);
+const COAT_SHELL_CAT = 'Outer Shell';
+const PANT_SHELL_CAT = 'Outershell';
+const shellModelCode = (item) => {
+  for (const key of [item && item.sku, item && item.legacySku]) {
+    if (!key) continue;
+    const m = String(key).match(/OS(\d{2})/);
+    if (m) return m[1];
+  }
+  return null;
+};
+// 'prm' | 'std' | null(unknown) for one outer-shell item.
+const shellGrade = (item) => {
+  const code = shellModelCode(item);
+  if (code == null) return null;
+  if (PREMIUM_SHELL_MODELS.has(code)) return 'prm';
+  if (STANDARD_SHELL_MODELS.has(code)) return 'std';
+  return null;
+};
+// Premium-wins across all selected outer-shell items in one section's items
+// array. prefix is the selection-key prefix ('coat'|'pant'); shellCat is that
+// section's outer-shell category name. Returns true when the garment is premium.
+function computeAutoPremium(items, selections, prefix, shellCat) {
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.category !== shellCat) continue;
+    const key = prefix + '||' + it.category + '||' + i;
+    if (selections[key] && shellGrade(it) === 'prm') return true;
+  }
+  return false;
+}
+// A boolean grade map (true = premium) that returns the garment's auto grade for
+// every key unless that key has an explicit per-item override. Used as a
+// drop-in for the old per-item `grades` object everywhere pricing is computed,
+// so totals / Overview / PDF need no changes.
+function makeGradeProxy(autoPremium, overrides) {
+  return new Proxy(
+    {},
+    {
+      get(_t, key) {
+        if (typeof key !== 'string') return undefined;
+        const ov = overrides[key];
+        if (ov) return ov.grade === 'prm';
+        return autoPremium;
+      },
+      has() {
+        return true;
+      },
+    },
+  );
+}
+// Context that gives each ItemRow its effective grade + the override controls,
+// routed by the item key's prefix ('coat' vs 'pant'). Same idiom as
+// DiagramContext below.
+const GradeContext = React.createContext(null);
+// Context for free-text per-item notes. Each ItemRow can attach a note that
+// surfaces in the matching customization-notes box (coat vs pant) and the PDF,
+// the same way material overrides do. Routed by the item key's prefix.
+const ItemNoteContext = React.createContext(null);
+
+// ─── Supabase (saved-build library) ───────────────────────────────────────────
+// The publishable key is safe to ship in a static site; access is enforced by
+// row-level security in the database (each rep sees only their own builds;
+// admins listed in admin_emails can see all).
+const SUPABASE_URL = 'https://xioryqtysebidnurobwo.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_RT6_uxj911HJ5vM6p-uvyg__6wlElGZ';
+const sb =
+  typeof window !== 'undefined' && window.supabase
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+// "June 14 2026" — matches the build-name format (no comma).
+const todayName = () =>
+  new Date()
+    .toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+    .replace(/,/g, '');
+
 // ─── PFP/LTO Pant Merge ───────────────────────────────────────────────────────
 // LTO pant categories that have no exact-name equivalent in PFP. When PFP is
 // selected, these still show (as a fallback) so nothing available under LTO
@@ -84,9 +171,9 @@ const MANUAL_PDF_URL =
 const MANUAL_PAGE_IMAGE_BASE_URL =
   'https://raw.githubusercontent.com/SteveHTG/MP_GEAR_BUILDER/main/page_';
 const SKU_PAGE_MAP_URL =
-  'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/sku_page_map.json';
+  'https://raw.githubusercontent.com/SteveHTG/MP_GEAR_BUILDER/main/sku_page_map.json';
 const CROSS_REFERENCE_URL =
-  'https://raw.githubusercontent.com/SteveHTG/Tails_Builder/main/cross_reference.json';
+  'https://raw.githubusercontent.com/SteveHTG/MP_GEAR_BUILDER/main/cross_reference.json';
 const normalizeSku = (s) => (s == null ? '' : String(s).trim().toUpperCase());
 function buildNormalizedMap(raw) {
   const out = {};
@@ -223,11 +310,27 @@ function ItemRow({
   onGradeToggle = () => {},
 }) {
   const isGraded = item.priceStd != null && item.pricePrm != null;
-  const price = resolveItemPrice(item, isGraded && isPremium ? 'prm' : 'std');
+  const gctx = React.useContext(GradeContext);
+  const override = isGraded && gctx ? gctx.getOverride(itemKey) : null;
+  const autoGrade = isGraded && gctx ? gctx.getAuto(itemKey) : 'std';
+  const effGrade = isGraded
+    ? override
+      ? override.grade
+      : gctx
+        ? autoGrade
+        : isPremium
+          ? 'prm'
+          : 'std'
+    : 'std';
+  const price = resolveItemPrice(item, effGrade);
   const isTBD = price == null;
   const desc = item.description && item.description !== '-' ? item.description : '';
   const diagramCtx = React.useContext(DiagramContext);
   const diagramMatch = item.sku && diagramCtx ? diagramCtx.lookupDiagram(item.sku) : null;
+  const nctx = React.useContext(ItemNoteContext);
+  const itemNote = nctx ? nctx.getNote(itemKey) : '';
+  const [noteOpen, setNoteOpen] = React.useState(false);
+  const showNote = noteOpen || !!itemNote;
   const handleCheckbox = () => {
     if (checked) {
       onQtyChange(itemKey, 0);
@@ -274,16 +377,94 @@ function ItemRow({
             ))}
           {desc && <span className="text-sm text-slate-200">{desc}</span>}
         </div>
-        {isGraded && (
-          <label className="flex items-center gap-1.5 mt-1 text-xs text-purple-300 cursor-pointer select-none w-fit">
-            <input
-              type="checkbox"
-              checked={isPremium}
-              onChange={() => onGradeToggle(itemKey)}
-              className="w-3.5 h-3.5 accent-purple-500 cursor-pointer"
-            />
-            Use Premium Material
-          </label>
+        {isGraded && gctx && (
+          <div className="mt-1 flex flex-col gap-1 w-full" onClick={(e) => e.preventDefault()}>
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <span
+                className={
+                  'font-semibold ' +
+                  (effGrade === 'prm' ? 'text-purple-300' : 'text-slate-400')
+                }
+              >
+                {effGrade === 'prm' ? '◆ Premium material' : 'Standard material'}
+                <span className="text-slate-500 font-normal">
+                  {override ? ' (custom)' : ' (auto from shell)'}
+                </span>
+              </span>
+              {!override ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    gctx.setOverride(itemKey, effGrade === 'prm' ? 'std' : 'prm', item);
+                  }}
+                  className="text-[11px] underline text-blue-300 hover:text-blue-200"
+                >
+                  {effGrade === 'prm' ? 'Use Standard instead' : 'Use Premium instead'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    gctx.clearOverride(itemKey);
+                  }}
+                  className="text-[11px] underline text-slate-400 hover:text-slate-200"
+                >
+                  Revert to auto ({autoGrade === 'prm' ? 'Premium' : 'Standard'})
+                </button>
+              )}
+            </div>
+            {override && (
+              <input
+                type="text"
+                value={override.note || ''}
+                onChange={(e) => gctx.setNote(itemKey, e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                placeholder="Note: which material to use (shows in the quote notes)…"
+                className="w-full bg-slate-900 border border-amber-600/50 rounded px-2 py-1 text-xs text-amber-100 placeholder-slate-600 focus:outline-none focus:border-amber-500"
+              />
+            )}
+          </div>
+        )}
+        {nctx && (
+          <div className="mt-1" onClick={(e) => e.preventDefault()}>
+            {!showNote ? (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setNoteOpen(true);
+                }}
+                className="text-[11px] text-slate-400 hover:text-sky-300 underline"
+              >
+                + Add note
+              </button>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={itemNote}
+                  onChange={(e) => nctx.setNote(itemKey, e.target.value, item)}
+                  onClick={(e) => e.stopPropagation()}
+                  placeholder="Note for this item (shows in the quote notes)…"
+                  className="flex-1 bg-slate-900 border border-sky-700/60 rounded px-2 py-1 text-xs text-sky-100 placeholder-slate-600 focus:outline-none focus:border-sky-500"
+                />
+                <button
+                  type="button"
+                  title="Remove note"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    nctx.setNote(itemKey, '', item);
+                    setNoteOpen(false);
+                  }}
+                  className="text-xs text-slate-500 hover:text-red-300 px-1"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+          </div>
         )}
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
@@ -1093,6 +1274,27 @@ function OverviewPanel({
 }
 
 // ─── PDF ────────────────────────────────────────────────────────────────────────────────────
+// Date helpers — the Quote Date field is an <input type="date"> (YYYY-MM-DD).
+const parseQuoteDate = (s) => {
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s));
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+};
+const fmtDateLong = (s) =>
+  (parseQuoteDate(s) || new Date()).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+const fmtDateMMDDYY = (s) => {
+  const d = parseQuoteDate(s) || new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const yy = String(d.getFullYear()).slice(-2);
+  return mm + dd + yy;
+};
 function generatePDF(
   coatItems,
   pantItems,
@@ -1106,6 +1308,7 @@ function generatePDF(
   discountPct,
   coatNotes,
   pantNotes,
+  fileNameDefault,
 ) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({
@@ -1144,7 +1347,9 @@ function generatePDF(
     doc.setFont('helvetica', 'normal');
     doc.setTextColor(180, 200, 230);
     doc.text(
-      'Horizon Turnout Gear  |  Morning Pride Authorized Distributor  |  ' + today,
+      (quoteInfo.company ? quoteInfo.company + '  |  ' : '') +
+        'Morning Pride Authorized Distributor  |  ' +
+        today,
       W / 2,
       24,
       {
@@ -1168,17 +1373,19 @@ function generatePDF(
       H - 14,
     );
     doc.text(
-      'material availability, and formal order confirmation. Contact your Horizon Turnout Gear representative for a binding quotation.',
+      'material availability, and formal order confirmation. Contact your ' +
+        (quoteInfo.company || 'sales') +
+        ' representative for a binding quotation.',
       M,
       H - 10,
     );
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(6.5);
     doc.setTextColor(...GOLD);
-    doc.text('Steve Smith | 407-232-4493 | steve@horizonturnout.com', M, H - 5.5);
-    doc.setTextColor(150, 170, 200);
-    doc.setFont('helvetica', 'normal');
-    doc.text('John Grivalsky | 973-703-0888 | john@horizonturnout.com', W / 2 + 10, H - 5.5);
+    const contactLine = [quoteInfo.salesman, quoteInfo.salesmanPhone, quoteInfo.salesmanEmail]
+      .filter((s) => s && String(s).trim())
+      .join('  |  ');
+    if (contactLine) doc.text(contactLine, M, H - 5.5);
   }
   function quoteBlock(y) {
     doc.setFillColor(240, 244, 250);
@@ -1189,10 +1396,10 @@ function generatePDF(
     doc.text('QUOTE INFORMATION', M + 4, y + 7);
     const half = (W - M * 2 - 8) / 2;
     [
-      ['Dealer / Distributor:', quoteInfo.dealer || ''],
+      ['Company:', quoteInfo.company || ''],
       ['Salesman:', quoteInfo.salesman || ''],
       ['Department / Organization:', quoteInfo.department || ''],
-      ['Date:', quoteInfo.date || today],
+      ['Date:', fmtDateLong(quoteInfo.date)],
     ].forEach(([label, val], idx) => {
       const col = idx % 2,
         row = Math.floor(idx / 2),
@@ -1420,7 +1627,19 @@ function generatePDF(
     M + 4,
     noteY,
   );
-  doc.save('Morning_Pride_Quote.pdf');
+  const def = fileNameDefault || 'Morning Pride Quote';
+  let chosen =
+    typeof window !== 'undefined' && window.prompt
+      ? window.prompt('Save PDF as (file name):', def)
+      : def;
+  if (chosen === null) return; // user cancelled the dialog
+  chosen = String(chosen)
+    .replace(/[\\/:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!chosen) chosen = def;
+  if (!/\.pdf$/i.test(chosen)) chosen += '.pdf';
+  doc.save(chosen);
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────────────────────────────
@@ -1522,7 +1741,31 @@ function DiagramModal({ modal, onClose, onSelectPage }) {
     </div>
   );
 }
-function App() {
+// ─── Back-to-top button ───────────────────────────────────────────────────────
+function ScrollTopButton() {
+  const [show, setShow] = React.useState(false);
+  React.useEffect(() => {
+    const onScroll = () => setShow(window.scrollY > 400);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+  if (!show) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+      title="Back to top"
+      aria-label="Back to top"
+      className="fixed bottom-5 right-5 z-50 w-11 h-11 flex items-center justify-center rounded-full bg-blue-600 hover:bg-blue-500 text-white shadow-lg border border-blue-400/40"
+    >
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+      </svg>
+    </button>
+  );
+}
+function App({ session }) {
   const [tab, setTab] = React.useState('coat');
   const [pantType, setPantType] = React.useState('');
   const [suspEnabled, setSuspEnabled] = React.useState(false);
@@ -1541,20 +1784,41 @@ function App() {
   // the LTO/PFP/shared split used for pantSels/pantQtys above, since a graded
   // item's key lives in exactly one of those three pools depending on whether
   // its category is mode-specific or an LTO-only fallback.
-  const [itemGradesLTO, setItemGradesLTO] = React.useState({});
-  const [itemGradesPFP, setItemGradesPFP] = React.useState({});
-  const [itemGradesShared, setItemGradesShared] = React.useState({});
-  // Coat's graded items live in a single flat array (no LTO/PFP mode split),
-  // so this is just one pool, same shape as the pant grade maps above.
-  const [itemGradesCoat, setItemGradesCoat] = React.useState({});
+  // Per-item materials-grade OVERRIDES. The grade is normally auto-derived from
+  // the selected outer shell (see computeAutoPremium); these maps only hold the
+  // exceptions a rep explicitly sets. Each entry: { grade:'std'|'prm', note, sku,
+  // desc }. Split LTO/PFP/shared the same way selections are, so switching pant
+  // type preserves the right overrides.
+  const [pantOverridesLTO, setPantOverridesLTO] = React.useState({});
+  const [pantOverridesPFP, setPantOverridesPFP] = React.useState({});
+  const [pantOverridesShared, setPantOverridesShared] = React.useState({});
+  // Coat overrides: a single flat pool (no LTO/PFP mode split).
+  const [coatOverrides, setCoatOverrides] = React.useState({});
+  // Free-text per-item notes. Each entry: { text, sku, desc }. Coat is one flat
+  // pool; pant mirrors the LTO/PFP/shared split; suspenders are their own pool
+  // and surface in the pant notes box.
+  const [coatItemNotes, setCoatItemNotes] = React.useState({});
+  const [pantItemNotesLTO, setPantItemNotesLTO] = React.useState({});
+  const [pantItemNotesPFP, setPantItemNotesPFP] = React.useState({});
+  const [pantItemNotesShared, setPantItemNotesShared] = React.useState({});
+  const [suspItemNotes, setSuspItemNotes] = React.useState({});
   const [search, setSearch] = React.useState('');
   const [showReset, setShowReset] = React.useState(false);
+  // Per-quote info (travels with each saved build).
   const [quoteInfo, setQuoteInfo] = React.useState({
-    dealer: '',
-    salesman: '',
     department: '',
     date: '',
   });
+  // The rep's own PDF identity (company + salesman contact). Saved once to their
+  // Supabase profile and auto-filled on every quote, regardless of which build
+  // is open — the quote is being sent by whoever is logged in.
+  const [profile, setProfile] = React.useState({
+    company: '',
+    salesman: '',
+    salesmanPhone: '',
+    salesmanEmail: '',
+  });
+  const [profileLoaded, setProfileLoaded] = React.useState(false);
   const [discountPct, setDiscountPct] = React.useState(0);
   const [coatNotes, setCoatNotes] = React.useState('');
   const [pantNotes, setPantNotes] = React.useState('');
@@ -1665,8 +1929,8 @@ function App() {
   const setCurrentPantSels = pantType === 'lto' ? setPantSelsLTO : setPantSelsPFP;
   const currentPantQtys = pantType === 'lto' ? pantQtysLTO : pantQtysPFP;
   const setCurrentPantQtys = pantType === 'lto' ? setPantQtysLTO : setPantQtysPFP;
-  const currentItemGrades = pantType === 'lto' ? itemGradesLTO : itemGradesPFP;
-  const setCurrentItemGrades = pantType === 'lto' ? setItemGradesLTO : setItemGradesPFP;
+  const currentPantOverrides = pantType === 'lto' ? pantOverridesLTO : pantOverridesPFP;
+  const setCurrentPantOverrides = pantType === 'lto' ? setPantOverridesLTO : setPantOverridesPFP;
   // Merged view used for rendering/totals: the shared LTO-only-fallback pool
   // (same regardless of LTO/PFP) plus whichever per-mode pool is active.
   // Key namespaces never collide -- a category lives in exactly one of the two.
@@ -1678,9 +1942,36 @@ function App() {
     () => ({ ...pantQtysShared, ...currentPantQtys }),
     [pantQtysShared, currentPantQtys],
   );
-  const mergedItemGrades = React.useMemo(
-    () => ({ ...itemGradesShared, ...currentItemGrades }),
-    [itemGradesShared, currentItemGrades],
+  const mergedPantOverrides = React.useMemo(
+    () => ({ ...pantOverridesShared, ...currentPantOverrides }),
+    [pantOverridesShared, currentPantOverrides],
+  );
+  const currentPantItemNotes = pantType === 'lto' ? pantItemNotesLTO : pantItemNotesPFP;
+  const setCurrentPantItemNotes = pantType === 'lto' ? setPantItemNotesLTO : setPantItemNotesPFP;
+  const mergedPantItemNotes = React.useMemo(
+    () => ({ ...pantItemNotesShared, ...currentPantItemNotes }),
+    [pantItemNotesShared, currentPantItemNotes],
+  );
+  // Auto materials grade per garment, derived from the selected outer shell(s).
+  const coatAutoPremium = React.useMemo(
+    () => computeAutoPremium(CATALOG.coat.items, coatSels, 'coat', COAT_SHELL_CAT),
+    [coatSels],
+  );
+  const pantAutoPremium = React.useMemo(
+    () =>
+      pantType
+        ? computeAutoPremium(CATALOG[pantType].items, mergedPantSels, 'pant', PANT_SHELL_CAT)
+        : false,
+    [pantType, mergedPantSels],
+  );
+  // Boolean grade maps (auto + overrides) consumed by panels/Overview/PDF.
+  const coatGradeProxy = React.useMemo(
+    () => makeGradeProxy(coatAutoPremium, coatOverrides),
+    [coatAutoPremium, coatOverrides],
+  );
+  const pantGradeProxy = React.useMemo(
+    () => makeGradeProxy(pantAutoPremium, mergedPantOverrides),
+    [pantAutoPremium, mergedPantOverrides],
   );
   React.useEffect(() => {
     if (!pantType) return;
@@ -1746,14 +2037,22 @@ function App() {
       })),
     [],
   );
-  const handleCoatGradeToggle = React.useCallback(
-    (k) =>
-      setItemGradesCoat((p) => ({
-        ...p,
-        [k]: !p[k],
-      })),
-    [],
-  );
+  const setCoatOverride = React.useCallback((k, grade, item) => {
+    setCoatOverrides((p) => ({
+      ...p,
+      [k]: { grade, note: (p[k] && p[k].note) || '', sku: skuLabel(item), desc: item.description || '' },
+    }));
+  }, []);
+  const clearCoatOverride = React.useCallback((k) => {
+    setCoatOverrides((p) => {
+      const n = { ...p };
+      delete n[k];
+      return n;
+    });
+  }, []);
+  const setCoatOverrideNote = React.useCallback((k, note) => {
+    setCoatOverrides((p) => (p[k] ? { ...p, [k]: { ...p[k], note } } : p));
+  }, []);
   const handlePantToggle = React.useCallback(
     (k) => {
       const cat = k.split('||')[1];
@@ -1799,22 +2098,112 @@ function App() {
     },
     [setCurrentPantQtys],
   );
-  const handleGradeToggle = React.useCallback(
-    (k) => {
-      const cat = k.split('||')[1];
-      if (LTO_ONLY_PANT_CATEGORIES.has(cat)) {
-        setItemGradesShared((p) => ({
-          ...p,
-          [k]: !p[k],
-        }));
-      } else {
-        setCurrentItemGrades((p) => ({
-          ...p,
-          [k]: !p[k],
-        }));
-      }
+  const pantOverrideSetter = React.useCallback(
+    (k) =>
+      LTO_ONLY_PANT_CATEGORIES.has(k.split('||')[1])
+        ? setPantOverridesShared
+        : setCurrentPantOverrides,
+    [setCurrentPantOverrides],
+  );
+  const setPantOverride = React.useCallback(
+    (k, grade, item) => {
+      pantOverrideSetter(k)((p) => ({
+        ...p,
+        [k]: { grade, note: (p[k] && p[k].note) || '', sku: skuLabel(item), desc: item.description || '' },
+      }));
     },
-    [setCurrentItemGrades],
+    [pantOverrideSetter],
+  );
+  const clearPantOverride = React.useCallback(
+    (k) => {
+      pantOverrideSetter(k)((p) => {
+        const n = { ...p };
+        delete n[k];
+        return n;
+      });
+    },
+    [pantOverrideSetter],
+  );
+  const setPantOverrideNote = React.useCallback(
+    (k, note) => {
+      pantOverrideSetter(k)((p) => (p[k] ? { ...p, [k]: { ...p[k], note } } : p));
+    },
+    [pantOverrideSetter],
+  );
+  const gradeCtxValue = React.useMemo(
+    () => ({
+      getAuto: (key) =>
+        key.startsWith('coat')
+          ? coatAutoPremium
+            ? 'prm'
+            : 'std'
+          : pantAutoPremium
+            ? 'prm'
+            : 'std',
+      getOverride: (key) =>
+        (key.startsWith('coat') ? coatOverrides[key] : mergedPantOverrides[key]) || null,
+      setOverride: (key, grade, item) =>
+        key.startsWith('coat')
+          ? setCoatOverride(key, grade, item)
+          : setPantOverride(key, grade, item),
+      clearOverride: (key) =>
+        key.startsWith('coat') ? clearCoatOverride(key) : clearPantOverride(key),
+      setNote: (key, note) =>
+        key.startsWith('coat') ? setCoatOverrideNote(key, note) : setPantOverrideNote(key, note),
+    }),
+    [
+      coatAutoPremium,
+      pantAutoPremium,
+      coatOverrides,
+      mergedPantOverrides,
+      setCoatOverride,
+      clearCoatOverride,
+      setCoatOverrideNote,
+      setPantOverride,
+      clearPantOverride,
+      setPantOverrideNote,
+    ],
+  );
+  const itemNoteSetterFor = React.useCallback(
+    (k) => {
+      if (k.startsWith('coat')) return setCoatItemNotes;
+      if (k.startsWith('susp')) return setSuspItemNotes;
+      return LTO_ONLY_PANT_CATEGORIES.has(k.split('||')[1])
+        ? setPantItemNotesShared
+        : setCurrentPantItemNotes;
+    },
+    [setCurrentPantItemNotes],
+  );
+  const setItemNote = React.useCallback(
+    (k, text, item) => {
+      itemNoteSetterFor(k)((p) => {
+        if (!text) {
+          if (!(k in p)) return p;
+          const n = { ...p };
+          delete n[k];
+          return n;
+        }
+        return {
+          ...p,
+          [k]: { text, sku: skuLabel(item), desc: (item && item.description) || '' },
+        };
+      });
+    },
+    [itemNoteSetterFor],
+  );
+  const itemNoteCtxValue = React.useMemo(
+    () => ({
+      getNote: (key) => {
+        const map = key.startsWith('coat')
+          ? coatItemNotes
+          : key.startsWith('susp')
+            ? suspItemNotes
+            : mergedPantItemNotes;
+        return (map[key] && map[key].text) || '';
+      },
+      setNote: setItemNote,
+    }),
+    [coatItemNotes, suspItemNotes, mergedPantItemNotes, setItemNote],
   );
   const handleSuspToggle = React.useCallback(
     (k) =>
@@ -1844,18 +2233,18 @@ function App() {
     () =>
       CATALOG.coat.items.reduce((s, it, i) => {
         const k = 'coat||' + it.category + '||' + i;
-        const grade = itemGradesCoat[k] ? 'prm' : 'std';
+        const grade = coatGradeProxy[k] ? 'prm' : 'std';
         return s + (coatSels[k] ? (resolveItemPrice(it, grade) ?? 0) * (coatQtys[k] ?? 1) : 0);
       }, 0),
-    [coatSels, coatQtys, itemGradesCoat],
+    [coatSels, coatQtys, coatGradeProxy],
   );
   const pantTotal = React.useMemo(() => {
     if (!pantType) return 0;
-    return getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, mergedItemGrades).reduce(
+    return getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, pantGradeProxy).reduce(
       (s, it) => s + (resolveItemPrice(it, it.grade) ?? 0) * it.qty,
       0,
     );
-  }, [pantType, mergedPantSels, mergedPantQtys, mergedItemGrades]);
+  }, [pantType, mergedPantSels, mergedPantQtys, pantGradeProxy]);
   const suspTotal = React.useMemo(
     () =>
       suspEnabled
@@ -1881,16 +2270,20 @@ function App() {
     setPantQtysPFP({});
     setPantQtysShared({});
     setSuspQtys({});
-    setItemGradesLTO({});
-    setItemGradesPFP({});
-    setItemGradesShared({});
+    setCoatOverrides({});
+    setPantOverridesLTO({});
+    setPantOverridesPFP({});
+    setPantOverridesShared({});
+    setCoatItemNotes({});
+    setPantItemNotesLTO({});
+    setPantItemNotesPFP({});
+    setPantItemNotesShared({});
+    setSuspItemNotes({});
     setPantType('');
     setSuspEnabled(false);
     setTab('coat');
     setSearch('');
     setQuoteInfo({
-      dealer: '',
-      salesman: '',
       department: '',
       date: '',
     });
@@ -1901,6 +2294,9 @@ function App() {
       lto: new Set(),
       pfp: new Set(),
     });
+    setBuildName('');
+    setSaveMsg('');
+    clearDraft();
     setShowReset(false);
   };
   const handleGeneratePDF = () => {
@@ -1911,14 +2307,49 @@ function App() {
             {
               ...it,
               qty: coatQtys[k] ?? 1,
-              grade: itemGradesCoat[k] ? 'prm' : 'std',
+              grade: coatGradeProxy[k] ? 'prm' : 'std',
             },
           ]
         : [];
     });
     const pantItems = pantType
-      ? getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, mergedItemGrades)
+      ? getCombinedPantItems(pantType, mergedPantSels, mergedPantQtys, pantGradeProxy)
       : [];
+    // Fold any per-item material overrides into the coat/pant notes so they
+    // appear on the PDF as explicit construction instructions.
+    const ovLines = (ovs, sels) =>
+      Object.entries(ovs)
+        .filter(([k, o]) => o && sels[k])
+        .map(
+          ([, o]) =>
+            '• ' +
+            (o.sku || 'item') +
+            ' — use ' +
+            (o.grade === 'prm' ? 'Premium' : 'Standard') +
+            ' material' +
+            (o.note ? ': ' + o.note : ''),
+        );
+    const noteLines = (ns, sels) =>
+      Object.entries(ns)
+        .filter(([k, n]) => n && n.text && sels[k])
+        .map(([, n]) => '• ' + (n.sku || 'item') + ': ' + n.text);
+    const buildNotes = (notes, ovBlock, noteBlock) =>
+      [
+        notes,
+        ovBlock.length ? 'Material overrides:\n' + ovBlock.join('\n') : '',
+        noteBlock.length ? 'Item notes:\n' + noteBlock.join('\n') : '',
+      ]
+        .filter((s) => s && s.trim())
+        .join('\n');
+    const coatNotesFull = buildNotes(
+      coatNotes,
+      ovLines(coatOverrides, coatSels),
+      noteLines(coatItemNotes, coatSels),
+    );
+    const pantNotesFull = buildNotes(pantNotes, ovLines(mergedPantOverrides, mergedPantSels), [
+      ...noteLines(mergedPantItemNotes, mergedPantSels),
+      ...noteLines(suspItemNotes, suspSels),
+    ]);
     const suspItems = suspEnabled
       ? CATALOG.suspenders.items.flatMap((it, i) => {
           const k = 'susp||' + it.category + '||' + i;
@@ -1941,12 +2372,292 @@ function App() {
       pantTotal,
       suspTotal,
       grandTotal,
+      { ...profile, ...quoteInfo },
+      discountPct,
+      coatNotesFull,
+      pantNotesFull,
+      [quoteInfo.department, fmtDateMMDDYY(quoteInfo.date), profile.company]
+        .map((s) => (s || '').trim())
+        .filter(Boolean)
+        .join('_') || 'Morning Pride Quote',
+    );
+  };
+  // ─── Saved-build library (Supabase) ─────────────────────────────────────────
+  const userEmail = session && session.user ? session.user.email : '';
+  const userId = session && session.user ? session.user.id : '';
+  const [isAdmin, setIsAdmin] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [saveMsg, setSaveMsg] = React.useState('');
+  const [buildName, setBuildName] = React.useState('');
+  const [builds, setBuilds] = React.useState([]);
+  const [buildsLoading, setBuildsLoading] = React.useState(false);
+  const [buildSearch, setBuildSearch] = React.useState('');
+  // Local draft auto-save (browser localStorage, NOT Supabase). A safety net so
+  // an in-progress quote survives a refresh/close. draftResolved gates the
+  // auto-save so we don't overwrite a saved draft before the user decides.
+  const draftKey = 'mp_gear_draft_v1_' + (userId || 'anon');
+  const [draftPending, setDraftPending] = React.useState(null);
+  const [draftResolved, setDraftResolved] = React.useState(false);
+  React.useEffect(() => {
+    if (!sb) return;
+    sb.rpc('is_admin')
+      .then(({ data }) => setIsAdmin(!!data))
+      .catch(() => {});
+  }, []);
+  // Load this rep's saved PDF identity once on login.
+  React.useEffect(() => {
+    if (!sb || !userId) {
+      setProfileLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    sb.from('profiles')
+      .select('company,salesman,salesman_phone,salesman_email')
+      .eq('user_id', userId)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (cancelled) return;
+        if (data)
+          setProfile({
+            company: data.company || '',
+            salesman: data.salesman || '',
+            salesmanPhone: data.salesman_phone || '',
+            salesmanEmail: data.salesman_email || '',
+          });
+        setProfileLoaded(true);
+      })
+      .catch(() => setProfileLoaded(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+  // Auto-save the profile (debounced) after it has loaded and then changes.
+  React.useEffect(() => {
+    if (!sb || !userId || !profileLoaded) return;
+    const t = setTimeout(() => {
+      sb.from('profiles')
+        .upsert({
+          user_id: userId,
+          company: profile.company,
+          salesman: profile.salesman,
+          salesman_phone: profile.salesmanPhone,
+          salesman_email: profile.salesmanEmail,
+        })
+        .then(
+          () => {},
+          () => {},
+        );
+    }, 800);
+    return () => clearTimeout(t);
+  }, [profile, userId, profileLoaded]);
+  const serializeBuild = React.useCallback(
+    () => ({
+      v: 1,
+      pantType,
+      suspEnabled,
+      coatSels,
+      pantSelsLTO,
+      pantSelsPFP,
+      pantSelsShared,
+      suspSels,
+      coatQtys,
+      pantQtysLTO,
+      pantQtysPFP,
+      pantQtysShared,
+      suspQtys,
+      coatOverrides,
+      pantOverridesLTO,
+      pantOverridesPFP,
+      pantOverridesShared,
+      coatItemNotes,
+      pantItemNotesLTO,
+      pantItemNotesPFP,
+      pantItemNotesShared,
+      suspItemNotes,
       quoteInfo,
       discountPct,
       coatNotes,
       pantNotes,
+      manualOverrides: { lto: [...manualOverrides.lto], pfp: [...manualOverrides.pfp] },
+    }),
+    [
+      pantType, suspEnabled, coatSels, pantSelsLTO, pantSelsPFP, pantSelsShared, suspSels,
+      coatQtys, pantQtysLTO, pantQtysPFP, pantQtysShared, suspQtys, coatOverrides,
+      pantOverridesLTO, pantOverridesPFP, pantOverridesShared, coatItemNotes, pantItemNotesLTO,
+      pantItemNotesPFP, pantItemNotesShared, suspItemNotes, quoteInfo, discountPct, coatNotes,
+      pantNotes, manualOverrides,
+    ],
+  );
+  const applyBuild = React.useCallback((d) => {
+    if (!d) return;
+    setPantType(d.pantType || '');
+    setSuspEnabled(!!d.suspEnabled);
+    setCoatSels(d.coatSels || {});
+    setPantSelsLTO(d.pantSelsLTO || {});
+    setPantSelsPFP(d.pantSelsPFP || {});
+    setPantSelsShared(d.pantSelsShared || {});
+    setSuspSels(d.suspSels || {});
+    setCoatQtys(d.coatQtys || {});
+    setPantQtysLTO(d.pantQtysLTO || {});
+    setPantQtysPFP(d.pantQtysPFP || {});
+    setPantQtysShared(d.pantQtysShared || {});
+    setSuspQtys(d.suspQtys || {});
+    setCoatOverrides(d.coatOverrides || {});
+    setPantOverridesLTO(d.pantOverridesLTO || {});
+    setPantOverridesPFP(d.pantOverridesPFP || {});
+    setPantOverridesShared(d.pantOverridesShared || {});
+    setCoatItemNotes(d.coatItemNotes || {});
+    setPantItemNotesLTO(d.pantItemNotesLTO || {});
+    setPantItemNotesPFP(d.pantItemNotesPFP || {});
+    setPantItemNotesShared(d.pantItemNotesShared || {});
+    setSuspItemNotes(d.suspItemNotes || {});
+    setQuoteInfo(d.quoteInfo || { department: '', date: '' });
+    setDiscountPct(d.discountPct || 0);
+    setCoatNotes(d.coatNotes || '');
+    setPantNotes(d.pantNotes || '');
+    setManualOverrides({
+      lto: new Set((d.manualOverrides && d.manualOverrides.lto) || []),
+      pfp: new Set((d.manualOverrides && d.manualOverrides.pfp) || []),
+    });
+  }, []);
+  // Does a saved draft have anything worth restoring?
+  const draftHasContent = (d) => {
+    if (!d) return false;
+    if (d.buildName && d.buildName.trim()) return true;
+    const b = d.build || {};
+    const anySel = [b.coatSels, b.pantSelsLTO, b.pantSelsPFP, b.pantSelsShared, b.suspSels].some(
+      (m) => m && Object.values(m).some(Boolean),
     );
+    if (anySel) return true;
+    if (b.quoteInfo && (b.quoteInfo.department || b.quoteInfo.date)) return true;
+    if (b.coatNotes || b.pantNotes) return true;
+    return false;
   };
+  // On login, look for a saved draft and ask before restoring it.
+  React.useEffect(() => {
+    if (!userId) return;
+    try {
+      const raw = localStorage.getItem(draftKey);
+      const d = raw ? JSON.parse(raw) : null;
+      if (draftHasContent(d)) setDraftPending(d);
+      else setDraftResolved(true);
+    } catch (e) {
+      setDraftResolved(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+  // Auto-save the working draft (debounced) once the prompt is resolved.
+  React.useEffect(() => {
+    if (!draftResolved || !userId) return;
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(draftKey, JSON.stringify({ build: serializeBuild(), buildName }));
+      } catch (e) {}
+    }, 800);
+    return () => clearTimeout(t);
+  }, [serializeBuild, buildName, draftResolved, userId, draftKey]);
+  const clearDraft = React.useCallback(() => {
+    try {
+      localStorage.removeItem(draftKey);
+    } catch (e) {}
+  }, [draftKey]);
+  const restoreDraft = React.useCallback(() => {
+    if (draftPending) {
+      applyBuild(draftPending.build);
+      setBuildName(draftPending.buildName || '');
+    }
+    setDraftPending(null);
+    setDraftResolved(true);
+  }, [draftPending, applyBuild]);
+  const discardDraft = React.useCallback(() => {
+    clearDraft();
+    setDraftPending(null);
+    setDraftResolved(true);
+  }, [clearDraft]);
+  const loadBuilds = React.useCallback(async () => {
+    if (!sb) return;
+    setBuildsLoading(true);
+    // Shared library: every logged-in rep can read all builds (read access is
+    // granted in the DB to authenticated users; writes are still owner-only).
+    const { data, error } = await sb
+      .from('builds')
+      .select('id,name,updated_at,user_id,data')
+      .order('updated_at', { ascending: false });
+    setBuildsLoading(false);
+    if (!error) setBuilds(data || []);
+  }, []);
+  React.useEffect(() => {
+    if (tab === 'import') loadBuilds();
+  }, [tab, loadBuilds]);
+  const saveBuild = React.useCallback(async () => {
+    if (!sb) {
+      setSaveMsg('Not connected — check your internet.');
+      return;
+    }
+    const name = buildName.trim();
+    if (!name) {
+      setSaveMsg('Enter a name for this build first.');
+      return;
+    }
+    setSaving(true);
+    setSaveMsg('');
+    const { data: existing, error: e1 } = await sb
+      .from('builds')
+      .select('name')
+      .eq('user_id', userId);
+    if (e1) {
+      setSaving(false);
+      setSaveMsg('Error: ' + e1.message);
+      return;
+    }
+    const taken = (existing || []).some(
+      (r) => (r.name || '').trim().toLowerCase() === name.toLowerCase(),
+    );
+    if (taken) {
+      setSaving(false);
+      setSaveMsg(
+        'A build named "' + name + '" already exists. Add a version (e.g. "V2") or another identifier.',
+      );
+      return;
+    }
+    const payload = serializeBuild();
+    payload._ownerEmail = userEmail;
+    const { error } = await sb.from('builds').insert({ name, data: payload });
+    setSaving(false);
+    setSaveMsg(error ? 'Error: ' + error.message : 'Saved as "' + name + '"');
+    if (!error) clearDraft();
+  }, [buildName, userId, userEmail, serializeBuild, clearDraft]);
+  const openBuild = React.useCallback(
+    (b) => {
+      applyBuild(b.data);
+      setBuildName(b.name || '');
+      setTab('overview');
+      setSaveMsg(
+        'Loaded "' + b.name + '". Change the name (e.g. add "V2") and Save Build to store a new version.',
+      );
+    },
+    [applyBuild],
+  );
+  const renameBuild = React.useCallback(async (b) => {
+    const nn = window.prompt('Rename build:', b.name);
+    if (nn == null) return;
+    const trimmed = nn.trim();
+    if (!trimmed || trimmed === b.name) return;
+    const { error } = await sb.from('builds').update({ name: trimmed }).eq('id', b.id);
+    if (!error) setBuilds((p) => p.map((x) => (x.id === b.id ? { ...x, name: trimmed } : x)));
+  }, []);
+  const deleteBuild = React.useCallback(async (b) => {
+    if (!window.confirm('Delete "' + b.name + '"? This cannot be undone.')) return;
+    const { error } = await sb.from('builds').delete().eq('id', b.id);
+    if (!error) setBuilds((p) => p.filter((x) => x.id !== b.id));
+  }, []);
+  const handleLogout = React.useCallback(() => {
+    if (sb) sb.auth.signOut();
+  }, []);
+  const filteredBuilds = React.useMemo(() => {
+    const q = buildSearch.trim().toLowerCase();
+    return q ? builds.filter((b) => (b.name || '').toLowerCase().includes(q)) : builds;
+  }, [builds, buildSearch]);
   React.useMemo(() => {
     if (typeof window !== 'undefined' && !window.jspdf) {
       const s = document.createElement('script');
@@ -1956,9 +2667,23 @@ function App() {
   }, []);
   return (
     <DiagramContext.Provider value={diagramCtxValue}>
+      <GradeContext.Provider value={gradeCtxValue}>
+       <ItemNoteContext.Provider value={itemNoteCtxValue}>
         <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
           <header className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 border-b border-slate-700 shadow-xl">
             <div className="max-w-7xl mx-auto px-4 py-4">
+              <div className="flex justify-end items-center gap-3 mb-2 text-xs text-slate-400">
+                <span className="truncate max-w-[55%]">
+                  {userEmail}
+                  {isAdmin ? ' (admin)' : ''}
+                </span>
+                <button
+                  onClick={handleLogout}
+                  className="text-slate-300 hover:text-white underline flex-shrink-0"
+                >
+                  Log out
+                </button>
+              </div>
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                 <div className="flex items-center gap-4">
                   <div className="w-20 h-16 bg-white rounded-lg flex items-center justify-center overflow-hidden shadow-lg border border-slate-600 p-1">
@@ -1975,9 +2700,6 @@ function App() {
                     <h1 className="text-xl sm:text-2xl font-black text-white leading-tight">
                       Turnout Gear <span className="text-red-500">Builder</span>
                     </h1>
-                    <div className="text-xs text-slate-400 mt-0.5">
-                      Horizon Turnout Gear — Authorized Distributor
-                    </div>
                   </div>
                 </div>
                 <div className="bg-slate-800/80 border border-slate-600 rounded-xl px-5 py-3 min-w-[220px]">
@@ -2027,6 +2749,10 @@ function App() {
                     id: 'overview',
                     label: '\uD83D\uDCCB  Overview',
                   },
+                  {
+                    id: 'import',
+                    label: '\uD83D\uDCC2  Import Build',
+                  },
                 ].map((t) => (
                   <button
                     key={t.id}
@@ -2053,7 +2779,7 @@ function App() {
                 <div className="mb-4">
                   <input
                     type="text"
-                    placeholder="Search SKUs or descriptions\u2026"
+                    placeholder="Search SKUs or descriptions…"
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -2065,8 +2791,7 @@ function App() {
                   onToggle={handleCoatToggle}
                   onQtyChange={handleCoatQty}
                   search={search}
-                  grades={itemGradesCoat}
-                  onGradeToggle={handleCoatGradeToggle}
+                  grades={coatGradeProxy}
                 />
               </React.Fragment>
             )}
@@ -2115,7 +2840,7 @@ function App() {
                   <div className="mb-4">
                     <input
                       type="text"
-                      placeholder="Search SKUs or descriptions\u2026"
+                      placeholder="Search SKUs or descriptions…"
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                       className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -2135,8 +2860,7 @@ function App() {
                     onSuspToggle={handleSuspToggle}
                     onSuspQtyChange={handleSuspQty}
                     suspEnabled={suspEnabled}
-                    grades={mergedItemGrades}
-                    onGradeToggle={handleGradeToggle}
+                    grades={pantGradeProxy}
                   />
                 )}
               </React.Fragment>
@@ -2145,47 +2869,59 @@ function App() {
               <React.Fragment>
                 <div className="mb-6 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
                   <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">
-                    Quote Information — Appears on PDF
+                    Quote Details — Appears on PDF
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     {[
-                      {
-                        key: 'dealer',
-                        label: 'Dealer / Distributor',
-                        ph: 'e.g. Horizon Turnout Gear',
-                      },
-                      {
-                        key: 'salesman',
-                        label: 'Salesman',
-                        ph: 'e.g. Steve Smith',
-                      },
-                      {
-                        key: 'department',
-                        label: 'Department / Organization',
-                        ph: 'e.g. Orange County Fire Rescue',
-                      },
-                      {
-                        key: 'date',
-                        label: 'Quote Date',
-                        ph: 'e.g. June 14, 2026',
-                      },
+                      { key: 'company', label: 'Company', ph: 'e.g. Horizon Turnout Gear' },
+                      { key: 'salesman', label: 'Salesman', ph: 'e.g. Steve Smith' },
+                      { key: 'salesmanPhone', label: 'Salesman Phone', ph: 'e.g. 123 456 7891' },
+                      { key: 'salesmanEmail', label: 'Salesman Email', ph: 'e.g. you@company.com' },
                     ].map((f) => (
                       <div key={f.key}>
                         <label className="block text-xs text-slate-400 mb-1">{f.label}</label>
                         <input
                           type="text"
-                          value={quoteInfo[f.key]}
+                          value={profile[f.key]}
                           onChange={(e) =>
-                            setQuoteInfo((p) => ({
-                              ...p,
-                              [f.key]: e.target.value,
-                            }))
+                            setProfile((p) => ({ ...p, [f.key]: e.target.value }))
                           }
                           placeholder={f.ph}
                           className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
                         />
                       </div>
                     ))}
+                  </div>
+                  <div className="mt-1.5 text-[11px] text-slate-500">
+                    Company &amp; salesman info is saved to your login and reused on every quote.
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Department / Organization
+                      </label>
+                      <input
+                        type="text"
+                        value={quoteInfo.department}
+                        onChange={(e) =>
+                          setQuoteInfo((p) => ({ ...p, department: e.target.value }))
+                        }
+                        placeholder="e.g. Orange County Fire Rescue"
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Quote Date (blank = today)
+                      </label>
+                      <input
+                        type="date"
+                        value={quoteInfo.date}
+                        onChange={(e) => setQuoteInfo((p) => ({ ...p, date: e.target.value }))}
+                        style={{ colorScheme: 'dark' }}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-700">
                     <label className="block text-xs text-slate-400 mb-1">Discount Percentage</label>
@@ -2217,35 +2953,140 @@ function App() {
                       <label className="block text-xs text-slate-400 mb-1">
                         Coat Customization Notes
                       </label>
-                      <textarea
-                        value={coatNotes}
-                        onChange={(e) => setCoatNotes(e.target.value)}
-                        placeholder="Special instructions for coat construction\u2026"
-                        rows={3}
-                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
-                      />
+                      <div className="w-full bg-slate-900 border border-slate-600 rounded-lg focus-within:border-blue-500">
+                        {(() => {
+                          const ovs = Object.entries(coatOverrides).filter(([k]) => coatSels[k]);
+                          return ovs.length > 0 ? (
+                            <div className="px-3 pt-2 pb-1.5 text-[11px] text-amber-300/90 space-y-0.5 border-b border-slate-700/70">
+                              <div className="font-semibold text-amber-300">
+                                Material overrides (added to PDF):
+                              </div>
+                              {ovs.map(([k, o]) => (
+                                <div key={k}>
+                                  • {o.sku || 'item'} — {o.grade === 'prm' ? 'Premium' : 'Standard'}
+                                  {o.note ? ': ' + o.note : ''}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null;
+                        })()}
+                        {(() => {
+                          const ns = Object.entries(coatItemNotes).filter(([k]) => coatSels[k]);
+                          return ns.length > 0 ? (
+                            <div className="px-3 pt-2 pb-1.5 text-[11px] text-sky-300/90 space-y-0.5 border-b border-slate-700/70">
+                              <div className="font-semibold text-sky-300">
+                                Item notes (added to PDF):
+                              </div>
+                              {ns.map(([k, n]) => (
+                                <div key={k}>
+                                  • {n.sku || 'item'}: {n.text}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null;
+                        })()}
+                        <textarea
+                          value={coatNotes}
+                          onChange={(e) => setCoatNotes(e.target.value)}
+                          placeholder="Special instructions for coat construction…"
+                          rows={3}
+                          className="w-full bg-transparent border-0 px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none resize-y"
+                        />
+                      </div>
                     </div>
                     <div>
                       <label className="block text-xs text-slate-400 mb-1">
                         Pant Customization Notes
                       </label>
-                      <textarea
-                        value={pantNotes}
-                        onChange={(e) => setPantNotes(e.target.value)}
-                        placeholder="Special instructions for pant construction\u2026"
-                        rows={3}
-                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-y"
-                      />
+                      <div className="w-full bg-slate-900 border border-slate-600 rounded-lg focus-within:border-blue-500">
+                        {(() => {
+                          const ovs = Object.entries(mergedPantOverrides).filter(
+                            ([k]) => mergedPantSels[k],
+                          );
+                          return ovs.length > 0 ? (
+                            <div className="px-3 pt-2 pb-1.5 text-[11px] text-amber-300/90 space-y-0.5 border-b border-slate-700/70">
+                              <div className="font-semibold text-amber-300">
+                                Material overrides (added to PDF):
+                              </div>
+                              {ovs.map(([k, o]) => (
+                                <div key={k}>
+                                  • {o.sku || 'item'} — {o.grade === 'prm' ? 'Premium' : 'Standard'}
+                                  {o.note ? ': ' + o.note : ''}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null;
+                        })()}
+                        {(() => {
+                          const ns = [
+                            ...Object.entries(mergedPantItemNotes).filter(([k]) => mergedPantSels[k]),
+                            ...Object.entries(suspItemNotes).filter(([k]) => suspSels[k]),
+                          ];
+                          return ns.length > 0 ? (
+                            <div className="px-3 pt-2 pb-1.5 text-[11px] text-sky-300/90 space-y-0.5 border-b border-slate-700/70">
+                              <div className="font-semibold text-sky-300">
+                                Item notes (added to PDF):
+                              </div>
+                              {ns.map(([k, n]) => (
+                                <div key={k}>
+                                  • {n.sku || 'item'}: {n.text}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null;
+                        })()}
+                        <textarea
+                          value={pantNotes}
+                          onChange={(e) => setPantNotes(e.target.value)}
+                          placeholder="Special instructions for pant construction…"
+                          rows={3}
+                          className="w-full bg-transparent border-0 px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none resize-y"
+                        />
+                      </div>
                     </div>
                   </div>
+                </div>
+                <div className="mb-6 p-4 bg-slate-800/80 border border-emerald-700/40 rounded-xl">
+                  <div className="text-sm font-bold text-emerald-300 mb-2">Save this build</div>
+                  <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+                    <div className="flex-1 min-w-0">
+                      <label className="block text-xs text-slate-400 mb-1">Build name</label>
+                      <input
+                        type="text"
+                        value={buildName}
+                        onChange={(e) => setBuildName(e.target.value)}
+                        placeholder="e.g. Orange County Fire Rescue June 2026"
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                    <button
+                      onClick={saveBuild}
+                      disabled={saving || !buildName.trim()}
+                      className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold px-5 py-2.5 rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      {saving ? 'Saving…' : 'Save Build'}
+                    </button>
+                  </div>
+                  {saveMsg && (
+                    <div
+                      className={
+                        'mt-2 text-xs ' +
+                        (/error|already exists|enter|not connected/i.test(saveMsg)
+                          ? 'text-amber-300'
+                          : 'text-emerald-300')
+                      }
+                    >
+                      {saveMsg}
+                    </div>
+                  )}
                 </div>
                 <OverviewPanel
                   coatSels={coatSels}
                   coatQtys={coatQtys}
-                  coatGrades={itemGradesCoat}
+                  coatGrades={coatGradeProxy}
                   pantSels={mergedPantSels}
                   pantQtys={mergedPantQtys}
-                  pantGrades={mergedItemGrades}
+                  pantGrades={pantGradeProxy}
                   pantType={pantType || 'lto'}
                   suspSels={suspSels}
                   suspQtys={suspQtys}
@@ -2256,6 +3097,76 @@ function App() {
                   setDiscountPct={setDiscountPct}
                 />
               </React.Fragment>
+            )}
+            {tab === 'import' && (
+              <div className="max-w-3xl mx-auto">
+                <div className="mb-4 p-4 bg-slate-800/80 border border-slate-700 rounded-xl">
+                  <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-2">
+                    Import a Saved Build
+                  </div>
+                  <input
+                    type="text"
+                    value={buildSearch}
+                    onChange={(e) => setBuildSearch(e.target.value)}
+                    placeholder="Search all builds by department / name…"
+                    className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500"
+                  />
+                  <div className="mt-2 text-xs text-slate-500">
+                    Shared library — open any rep's build to build off it. Saving creates your own copy.
+                  </div>
+                </div>
+                {buildsLoading ? (
+                  <p className="text-slate-500 text-sm text-center py-8">Loading…</p>
+                ) : filteredBuilds.length === 0 ? (
+                  <p className="text-slate-500 text-sm text-center py-8">
+                    {builds.length === 0
+                      ? 'No saved builds yet. Build a quote, then hit "Save Build" on the Overview tab.'
+                      : 'No builds match your search.'}
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {filteredBuilds.map((b) => (
+                      <div
+                        key={b.id}
+                        className="flex items-center gap-3 bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 hover:border-slate-500 transition-colors"
+                      >
+                        <button onClick={() => openBuild(b)} className="flex-1 text-left min-w-0">
+                          <div className="text-sm font-semibold text-blue-300 truncate">
+                            {b.name}
+                          </div>
+                          <div className="text-xs text-slate-500">
+                            {new Date(b.updated_at).toLocaleString()}
+                            {b.data && b.data._ownerEmail ? ' • by ' + b.data._ownerEmail : ''}
+                            {b.user_id === userId ? ' • yours' : ''}
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => openBuild(b)}
+                          className="text-xs font-bold bg-blue-700 hover:bg-blue-600 text-white px-3 py-1.5 rounded flex-shrink-0"
+                        >
+                          Open
+                        </button>
+                        {b.user_id === userId && (
+                          <React.Fragment>
+                            <button
+                              onClick={() => renameBuild(b)}
+                              className="text-xs text-slate-300 hover:text-white px-2 py-1.5 flex-shrink-0"
+                            >
+                              Rename
+                            </button>
+                            <button
+                              onClick={() => deleteBuild(b)}
+                              className="text-xs text-red-400 hover:text-red-300 px-2 py-1.5 flex-shrink-0"
+                            >
+                              Delete
+                            </button>
+                          </React.Fragment>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
           </main>
           {showReset && (
@@ -2288,9 +3199,130 @@ function App() {
             onClose={closeDiagram}
             onSelectPage={selectDiagramPage}
           />
+          <ScrollTopButton />
+          {draftPending && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4">
+              <div className="bg-slate-800 border border-slate-600 rounded-2xl w-full max-w-sm p-6 shadow-2xl">
+                <div className="text-lg font-bold text-white mb-2">Unsaved draft found</div>
+                <div className="text-sm text-slate-300 mb-5">
+                  You have an in-progress quote from a previous session
+                  {draftPending.buildName ? ' ("' + draftPending.buildName + '")' : ''}. Restore
+                  it, or start fresh?
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={restoreDraft}
+                    className="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-bold py-2.5 rounded-lg transition-colors"
+                  >
+                    Restore
+                  </button>
+                  <button
+                    onClick={discardDraft}
+                    className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold py-2.5 rounded-lg transition-colors"
+                  >
+                    Start fresh
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
+       </ItemNoteContext.Provider>
+      </GradeContext.Provider>
     </DiagramContext.Provider>
   );
 }
+// ─── Login screen ─────────────────────────────────────────────────────────────
+function LoginScreen() {
+  const [email, setEmail] = React.useState('');
+  const [password, setPassword] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!sb) {
+      setErr('Cannot reach the login service. Check your connection.');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    const { error } = await sb.auth.signInWithPassword({ email: email.trim(), password });
+    setBusy(false);
+    if (error) setErr(error.message || 'Sign-in failed.');
+  };
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans flex items-center justify-center px-4">
+      <form
+        onSubmit={submit}
+        className="w-full max-w-sm bg-slate-900 border border-slate-700 rounded-2xl shadow-xl p-6"
+      >
+        <div className="flex items-center gap-3 mb-5">
+          <img src={MP_LOGO_B64} alt="Morning Pride" className="w-12 h-12 rounded bg-white p-1" />
+          <div>
+            <div className="text-xs font-bold tracking-widest text-red-400 uppercase">
+              Morning Pride
+            </div>
+            <div className="text-lg font-black leading-tight">Gear Builder — Sign in</div>
+          </div>
+        </div>
+        <label className="block text-xs text-slate-400 mb-1">Email</label>
+        <input
+          type="email"
+          autoComplete="username"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          className="w-full mb-3 bg-slate-950 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+        />
+        <label className="block text-xs text-slate-400 mb-1">Password</label>
+        <input
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="w-full mb-4 bg-slate-950 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+        />
+        {err && (
+          <div className="mb-3 text-xs text-red-300 bg-red-900/40 border border-red-700/50 rounded px-3 py-2">
+            {err}
+          </div>
+        )}
+        <button
+          type="submit"
+          disabled={busy}
+          className="w-full bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white font-bold py-2.5 rounded-lg transition-colors"
+        >
+          {busy ? 'Signing in…' : 'Sign in'}
+        </button>
+        <p className="mt-4 text-[11px] text-slate-500 text-center">
+          No account? Ask an administrator to add you.
+        </p>
+      </form>
+    </div>
+  );
+}
+
+// ─── Auth gate ────────────────────────────────────────────────────────────────
+function Root() {
+  const [session, setSession] = React.useState(undefined); // undefined = checking
+  React.useEffect(() => {
+    if (!sb) {
+      setSession(null);
+      return;
+    }
+    sb.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = sb.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+  if (session === undefined) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center text-sm">
+        Loading…
+      </div>
+    );
+  }
+  if (!session) return <LoginScreen />;
+  return <App session={session} key={session.user.id} />;
+}
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
+root.render(<Root />);
