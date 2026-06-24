@@ -3,7 +3,7 @@
 // Version this string any time you deploy updated files so the SW
 // triggers an install + activate cycle and the cache refreshes.
 
-const CACHE_NAME = 'mp-gear-builder-v23';
+const CACHE_NAME = 'mp-gear-builder-v18';
 
 // Every URL the app needs to function offline.
 // Add any additional static assets your build outputs here.
@@ -12,16 +12,13 @@ const PRECACHE_URLS = [
   './index.html',
   './manifest.json',
   './service-worker.js',
-  './app_source.jsx',
-  // catalog.js inlined into index.html (window.CATALOG); app code lives in
-  // app_source.jsx, compiled in-browser by Babel (see index.html)
+  // catalog.js inlined into index.html
   // CDN dependencies loaded at runtime by index.html / the app
   'https://cdn.tailwindcss.com',
   'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-  'https://unpkg.com/@supabase/supabase-js@2.108.2/dist/umd/supabase.js',
 ];
 
 // ── Install: pre-cache all app shell assets ───────────────────────────────────
@@ -70,10 +67,6 @@ self.addEventListener('fetch', event => {
 
   // Skip chrome-extension and non-http(s) requests.
   if (!event.request.url.startsWith('http')) return;
-
-  // Never cache Supabase API traffic (auth + the shared builds library must
-  // always be live). Let these go straight to the network, uncached.
-  if (event.request.url.includes('.supabase.co')) return;
 
   event.respondWith(
     caches.match(event.request).then(cached => {
