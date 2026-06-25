@@ -1428,6 +1428,10 @@ function generatePDF(
       ftr();
       y = 46;
     }
+    // Measure wrapping at the SAME font/size the lines are drawn at (7.5),
+    // otherwise long lines overflow the box.
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
     const lines = doc.splitTextToSize(notes, W - M * 2 - 8);
     const blockH = 10 + lines.length * 5;
     doc.setFillColor(230, 236, 248);
